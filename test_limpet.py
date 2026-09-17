@@ -129,9 +129,38 @@ def test_block_path(path, rules):
     sys.stderr = sys.__stderr__
 
 
+def test_suggest():
+    path = write([
+        claude_line("user", "fix the login bug"),
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Edit", "input": {"file_path": "auth.py"}}]}}),
+        json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}),
+        claude_line("assistant", "Found it. Want me to apply the fix?"),
+        claude_line("user", "do it"),
+        claude_line("assistant", "Applied. Tests pass."),
+        claude_line("user", "thanks"),
+        claude_line("assistant", "Anything else?"),
+    ])
+    stops = limpet.scan(path)
+    assert [s["next"] for s in stops] == ["do it", "thanks"], stops
+    assert stops[0]["tools"] == ["Edit: auth.py → ok"] and stops[0]["context"] == ["fix the login bug"], stops[0]
+    limpet.transcript_files = lambda days: [path]
+    limpet.call = lambda body, key, provider: {"answers": {
+        "reaction": {"choice": "push" if "do it" in body["state"]["what the human said next"] else "ack", "confidence": 0.9},
+        "failure": {"choice": "handoff", "confidence": 0.8}}}
+    os.environ["AI_GATEWAY_API_KEY"] = "test"
+    out = io.StringIO()
+    sys.stdout = out
+    assert limpet.suggest(days=1, limit=10) == 0
+    sys.stdout = sys.__stdout__
+    text = out.getvalue()
+    assert "push" in text and "handoff: 1 (100%)" in text and "shall I start" in text, text
+    assert os.path.exists(os.path.join(TMP, "suggest.md"))
+
+
 if __name__ == "__main__":
     claude_path = test_claude_transcript()
     test_codex_transcript()
     rules = test_config_and_request()
     test_block_path(claude_path, rules)
+    test_suggest()
     print("ok")

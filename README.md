@@ -136,6 +136,36 @@ On first run limpet copies its default rules to `~/.limpet/rules.md`. Edit that 
 
 The [default rules](rules.md) are the nine that the author's agents actually break.
 
+## Find your rules
+
+You don't have to guess which rules you need. limpet can read your own transcripts and tell you:
+
+```sh
+python3 ~/limpet/limpet.py suggest            # last 30 days; --days 90 --max 5000 to go wider
+```
+
+It finds every place an agent stopped and you replied, asks jev how you reacted (pushed it on, corrected it, asked, moved on) and what the agent got wrong, and writes `~/.limpet/suggest.md`:
+
+```
+## What went wrong (598 stops the human pushed back on)
+
+### handoff: 259 (43%) — limpet can target this at stop time
+- agent: I've prepared the command. Paste it and run it.
+  human: can't you just write it to the file?
+### overreach: 87 (15%) — limpet can target this at stop time
+- agent: I also went ahead and invited the other projects…
+  human: why are you widening this? nobody asked for that
+### unverified: 60 (10%) — not visible at stop time
+- agent: Pushed to PR #339. Three re-reviews, nothing required.
+  human: ci failed
+
+## Suggested rules
+<!-- handoff: 43% of your bad stops -->
+- Don't ask "shall I start?" for work that was already requested …
+```
+
+1,500 stops take about 100 seconds and 15 cents. It reads Claude Code and Codex transcripts. It is honest about the types no stop-time rule can see (a success claim that CI later disproves, a fix that is simply wrong) so you know what limpet will and won't catch.
+
 ## Thresholds
 
 Start in **shadow mode**: no thresholds set. Every stop is scored and logged to `~/.limpet/log.jsonl`, nothing is blocked. After a day or two:
@@ -190,7 +220,7 @@ No key, API error, or timeout: exit 0, silently. A hook must never block work be
 
 ## Privacy
 
-Each stop sends the last three messages, one line per tool call of the current turn (tool name and its main argument), and the final message to the provider you chose. Nothing else leaves the machine. The log stays in `~/.limpet`.
+Each stop sends the last three messages, one line per tool call of the current turn (tool name and its main argument), and the final message to the provider you chose. `suggest` additionally sends your own replies, and edits of the turn are not sent. Nothing else leaves the machine. The log and the suggestions stay in `~/.limpet`.
 
 ## Test
 

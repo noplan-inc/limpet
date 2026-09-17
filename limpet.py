@@ -8,6 +8,7 @@ rule is over its threshold, the hook exits 2 with a message telling the agent to
 
     echo '{"transcript_path": "...", "stop_hook_active": false}' | python3 limpet.py
     python3 limpet.py --stats      # per-rule percentiles from the log, to pick thresholds
+    python3 limpet.py suggest      # mine your transcripts for the rules you actually need
 
 Configuration, in order of precedence: environment, then ~/.limpet/env (KEY=VALUE lines).
     TYPESAFE_API_KEY    TypeSafe key (https://console.typesafe.ai/keys) => calls api.typesafe.ai directly.
@@ -24,6 +25,7 @@ When installed as a Claude Code plugin, the key and thresholds also come from th
 
 No key, API down, or timeout => exit 0 silently. A hook must never stop the work.
 """
+import glob
 import json
 import os
 import re
@@ -317,8 +319,159 @@ def stats(path=None):
         print(f"p50={q(.5):.2f} p90={q(.9):.2f} p95={q(.95):.2f} max={ps[-1]:.2f} blocked={blocked:3d}  {r}")
 
 
+# --- suggest: mine transcripts for rules ---
+
+REACTIONS = {
+    "push": "the human tells the agent to do what it should already have done: 'do it', 'continue', 'go ahead', 'fix it', 'やって', '進めて'",
+    "correction": "the human points out a mistake, disagrees, or shows frustration: 'no', 'wrong', 'that's not it', 'why did you', '違う'",
+    "question": "the human asks a question about the work",
+    "new_request": "the human moves on to a new or follow-up task, satisfied with this one",
+    "ack": "the human acknowledges, thanks, or says ok",
+}
+FAILURES = {
+    "handoff": "the agent stopped and handed the work back: waiting, asking permission, offering options, telling the human to do it",
+    "unverified": "the agent reported success, completion, or 'all green' that later turned out to be false",
+    "misread": "the agent did something other than what was asked, e.g. implemented when only a proposal was requested",
+    "overreach": "the agent did or proposed things nobody asked for, used too many resources, or decided on its own",
+    "bug": "the fix itself was wrong, broke something, or did not fix the problem",
+    "wrong_target": "the agent worked on the wrong file, repo, destination, item, or model",
+    "stale": "the agent concluded from stale state without pulling, refetching, or rechecking",
+    "taste": "quality or preference: too thin, too short, wrong style, wrong wording, wrong language",
+    "other": "none of the above",
+}
+# what limpet can act on at stop time, and the rule that targets it
+CATCHABLE = {
+    "handoff": ["Don't ask \"shall I start?\" or \"I'll run it if that's OK\" for work that was already requested. Only ask before irreversible actions: production databases, deletion, sending to external services, payments, merges",
+                "Don't hand work to the human unless only a human can do it (biometric auth, payments, physical actions)",
+                "Fix problems you find before stopping. Don't stop at \"CI is failing\" or \"there's a bug\". If you can't fix it, say why",
+                "When waiting, give a time estimate. Don't stop with \"I'll wait for it to finish\""],
+    "misread": ["Don't confuse a request for a proposal or advice with a request to act. If asked for a proposal, don't implement it"],
+    "overreach": ["Don't stop to offer things that weren't asked for (\"want me to automate this too?\"). Proposals go in the last line of the report, at most",
+                  "Don't edit files outside the scope of the task"],
+    "taste": ["Answer in the language the human writes in"],
+}
+NOT_CATCHABLE = "not visible at stop time (the failure only shows up later, or needs context the transcript doesn't have)"
+
+
+def transcript_files(days):
+    cutoff = time.time() - days * 86400
+    paths = glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")) + glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/*.jsonl"))
+    return [p for p in paths if os.path.getmtime(p) >= cutoff]
+
+
+def scan(path):
+    """Every (agent stop, what the human said next) pair in one transcript, with context and tools."""
+    rows = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for l in f:
+            try:
+                rows.append(json.loads(l))
+            except ValueError:
+                continue
+    texts = []  # (index, "a"|"h", text)
+    for i, d in enumerate(rows):
+        a = assistant_text(d)
+        h = None if a else human_text(d)
+        if a or h:
+            texts.append((i, "a" if a else "h", a or h))
+    out, seen = [], set()
+    for j in range(len(texts) - 1):
+        i, kind, last = texts[j]
+        ni, nkind, nxt = texts[j + 1]
+        if kind != "a" or nkind != "h":
+            continue
+        key = (nxt[:200])  # parallel agents get the same reply attached to several stops; keep the last one
+        if key in seen:
+            continue
+        seen.add(key)
+        ctx = [t for _, _, t in texts[max(0, j - N_CONTEXT):j]][::-1]
+        out.append({"file": path, "context": [c[:MAXLEN] for c in ctx], "tools": tools_since_turn(rows[:i + 1]),
+                    "last": last[:MAXLEN], "next": nxt[:1500], "ts": rows[i].get("timestamp") or rows[i].get("ts") or ""})
+    return out
+
+
+def classify(stop, key, provider):
+    url, model, _, _ = PROVIDERS[provider]
+    state = {"previous messages (newest first)": stop["context"], "tool calls this turn (oldest first)": stop["tools"],
+             "agent's final message before stopping": stop["last"], "what the human said next": stop["next"]}
+    qs = {"reaction": {"type": "choice", "instructions": "How did the human react to the agent's final message?", "criteria": REACTIONS},
+          "failure": {"type": "choice", "instructions": "If the human was unhappy, what did the agent do wrong?", "criteria": FAILURES}}
+    body = {"state": state, "questions": qs}  # both providers take choice questions with "criteria"
+    if provider == "typesafe":
+        body["model"] = cfg("LIMPET_JEV_MODEL", model)
+    try:
+        ans = call(body, key, provider)["answers"]
+        return {q: (ans[q].get("choice") or max(ans[q]["probabilities"], key=ans[q]["probabilities"].get),
+                    ans[q].get("confidence", 0)) for q in qs}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+def suggest(days=30, limit=2000):
+    from concurrent.futures import ThreadPoolExecutor
+    load_env()
+    provider, key = api_key()
+    if not key:
+        print("limpet suggest needs a jev key (TYPESAFE_API_KEY or AI_GATEWAY_API_KEY).", file=sys.stderr)
+        return 1
+    files = transcript_files(days)
+    stops = [s for p in files for s in scan(p)]
+    stops.sort(key=lambda s: s["ts"], reverse=True)
+    stops = stops[:limit]
+    print(f"{len(stops)} stops with a human reply, from {len(files)} transcripts (last {days} days). Asking jev...", file=sys.stderr)
+    t0 = time.time()
+    with ThreadPoolExecutor(8) as ex:
+        results = list(ex.map(lambda s: classify(s, key, provider), stops))
+    ok = [(s, r) for s, r in zip(stops, results) if "error" not in r]
+    errors = len(stops) - len(ok)
+    bad = [(s, r) for s, r in ok if r["reaction"][0] in ("push", "correction")]
+    lines = [f"# limpet suggest", "",
+             f"{len(ok)} stops from {len(files)} transcripts, last {days} days, {int(time.time() - t0)} s of jev"
+             + (f", {errors} errors" if errors else "") + ".", "", "## How the human reacted to the agent stopping", ""]
+    counts = {k: sum(r["reaction"][0] == k for _, r in ok) for k in REACTIONS}
+    for k, n in sorted(counts.items(), key=lambda x: -x[1]):
+        lines.append(f"- {k:<12} {n:5}  {n / max(1, len(ok)):4.0%}")
+    lines += ["", f"## What went wrong ({len(bad)} stops the human pushed back on)", ""]
+    by = {k: [(s, r) for s, r in bad if r["failure"][0] == k] for k in FAILURES}
+    for k, items in sorted(by.items(), key=lambda x: -len(x[1])):
+        if not items:
+            continue
+        tag = ("only the wrong-language part is visible at stop time" if k == "taste"
+               else "limpet can target this at stop time" if k in CATCHABLE else NOT_CATCHABLE)
+        lines.append(f"### {k}: {len(items)} ({len(items) / max(1, len(bad)):.0%}) — {tag}")
+        for s, r in sorted(items, key=lambda x: -x[1]["failure"][1])[:3]:
+            lines.append(f"- agent: {_oneline(s['last'])}")
+            lines.append(f"  human: {_oneline(s['next'])}")
+        lines.append("")
+    lines += ["## Suggested rules", "", "Ordered by how much of your pain each one targets. Copy the ones you want into ~/.limpet/rules.md.", ""]
+    for k, items in sorted(by.items(), key=lambda x: -len(x[1])):
+        if k in CATCHABLE and items:
+            lines.append(f"<!-- {k}: {len(items) / max(1, len(bad)):.0%} of your bad stops -->")
+            lines += [f"- {rule}" for rule in CATCHABLE[k]]
+    untargetable = sum(len(v) for k, v in by.items() if k not in CATCHABLE)
+    lines += ["", f"{untargetable / max(1, len(bad)):.0%} of your bad stops are types no stop-time rule can see. "
+              "Those need verification (run the tests, check CI) rather than a rule.", ""]
+    out = os.path.join(HOME, "suggest.md")
+    os.makedirs(HOME, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print("\n".join(lines))
+    print(f"written to {out}", file=sys.stderr)
+    return 0
+
+
+def _oneline(s, n=110):
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[:n] + "…"
+
+
 if __name__ == "__main__":
-    if "--stats" in sys.argv[1:]:
+    args = sys.argv[1:]
+    if "--stats" in args:
         stats()
+    elif args and args[0] == "suggest":
+        days = int(args[args.index("--days") + 1]) if "--days" in args else 30
+        limit = int(args[args.index("--max") + 1]) if "--max" in args else 2000
+        sys.exit(suggest(days, limit))
     else:
         sys.exit(main())

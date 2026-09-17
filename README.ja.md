@@ -136,6 +136,36 @@ git clone https://github.com/noplan-inc/limpet ~/limpet
 
 [既定のルール](rules.md)は、作者のエージェントが実際に破る 9 本。
 
+## ルールを見つける
+
+どのルールが要るかは、推測しなくていい。limpet は自分の transcript を読んで教えてくれる:
+
+```sh
+python3 ~/limpet/limpet.py suggest            # 直近 30 日。--days 90 --max 5000 で広げる
+```
+
+エージェントが止まってあなたが返した場面を全部拾い、jev に「あなたはどう反応したか（催促・訂正・質問・次の依頼）」と「エージェントは何を間違えたか」を聞いて、`~/.limpet/suggest.md` に書く:
+
+```
+## What went wrong (598 stops the human pushed back on)
+
+### handoff: 259 (43%) — limpet can target this at stop time
+- agent: コマンドを用意したので、次を貼って実行してください。
+  human: さすがにファイルにかいてくれん？
+### overreach: 87 (15%) — limpet can target this at stop time
+- agent: 招待はまだできていません。他のプロジェクトも…
+  human: ちょっと勝手に広げないでよ。なんでその他のやつもやろうとしてんの？
+### unverified: 60 (10%) — not visible at stop time
+- agent: PR #339 へ push しました。3 人の再レビュー、必須修正なし。
+  human: ci failed
+
+## Suggested rules
+<!-- handoff: 43% of your bad stops -->
+- Don't ask "shall I start?" for work that was already requested …
+```
+
+1,500 停止で約 100 秒・15 セント。Claude Code と Codex の transcript を読む。「停止時には見えない型」（後で CI が落ちる成功報告、単に間違った修正）は正直にそう書くので、limpet が何を取れて何を取れないかが分かる。
+
 ## 閾
 
 まず**影の運転**から始める。閾は未設定。全停止が採点されて `~/.limpet/log.jsonl` に記録されるだけで、何も止めない。1〜2 日回したら:
@@ -190,7 +220,7 @@ limpet はその間にいる。ルールは任意の言語の自然言語で、�
 
 ## プライバシー
 
-1 停止ごとに送るのは、直前 3 メッセージ、このターンのツール呼び出し 1 行ずつ（ツール名と主引数）、最後の発話。選んだプロバイダにだけ送る。それ以外はマシンから出ない。ログは `~/.limpet` に残る。
+1 停止ごとに送るのは、直前 3 メッセージ、このターンのツール呼び出し 1 行ずつ（ツール名と主引数）、最後の発話。`suggest` はこれに加えてあなた自身の返しも送る。編集内容（diff）は送らない。選んだプロバイダにだけ送る。それ以外はマシンから出ない。ログと提案は `~/.limpet` に残る。
 
 ## テスト
 
