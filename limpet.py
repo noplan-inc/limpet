@@ -7,11 +7,13 @@ via Vercel AI Gateway). jev returns, for every rule in rules.md, the probability
 violated. If a rule is over its threshold, the hook exits 2 with a message telling the agent to keep working.
 
     echo '{"transcript_path": "...", "stop_hook_active": false}' | python3 limpet.py
+    python3 limpet.py key set      # store the jev key in the OS keychain (macOS Keychain / libsecret)
     python3 limpet.py suggest      # mine your transcripts for the rules you actually need
     python3 limpet.py calibrate    # score rules.md against your transcripts and print LIMPET_BLOCK
 
-Configuration, in order of precedence: environment, Claude Code plugin config (CLAUDE_PLUGIN_OPTION_*),
-then ~/.limpet/env (KEY=VALUE lines).
+Where the key comes from, first match wins: TYPESAFE_API_KEY / AI_GATEWAY_API_KEY in the environment, the
+Claude Code plugin config (CLAUDE_PLUGIN_OPTION_*) or ~/.limpet/env; then the OS keychain (`key set`); then
+LIMPET_KEY_CMD.
     TYPESAFE_API_KEY    TypeSafe key (https://console.typesafe.ai/keys) => calls api.typesafe.ai directly.
     AI_GATEWAY_API_KEY  Vercel AI Gateway key => calls jev through the gateway. Either key is enough.
     LIMPET_KEY_CMD      a shell command that prints the key, if you keep it in a password manager.
@@ -98,12 +100,59 @@ def load_rules(path=None):
         return [l[2:].strip() for l in f if l.startswith("- ")]
 
 
+# --- OS keychain: `security` on macOS, `secret-tool` (libsecret) on Linux ---
+
+def _keychain_cmd(op, provider):
+    if sys.platform == "darwin":
+        base = ["security", f"{op}-generic-password", "-s", "limpet", "-a", provider]
+        return {"find": base + ["-w"], "add": base + ["-U", "-w"], "delete": base}[op]
+    if sys.platform.startswith("linux"):
+        attrs = ["service", "limpet", "account", provider]
+        return {"find": ["secret-tool", "lookup"] + attrs, "add": ["secret-tool", "store", f"--label=limpet {provider}"] + attrs,
+                "delete": ["secret-tool", "clear"] + attrs}[op]
+    return None
+
+
+def keychain_key():
+    """(provider, key) from the OS keychain, or (None, None)."""
+    for provider in PROVIDERS:
+        cmd = _keychain_cmd("find", provider)
+        if not cmd:
+            return None, None
+        try:
+            k = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            k = ""
+        if k:
+            return provider, k
+    return None, None
+
+
+def key_cmd(action, provider):
+    """`limpet key set|rm`. `set` lets the keychain tool prompt for the secret, so it never touches argv or a file."""
+    cmd = _keychain_cmd({"set": "add", "rm": "delete"}[action], provider)
+    if not cmd:
+        print("No keychain support on this platform. Use the Claude Code plugin config, LIMPET_KEY_CMD, or ~/.limpet/env.", file=sys.stderr)
+        return 1
+    if action == "set" and sys.platform.startswith("linux"):
+        import getpass
+        r = subprocess.run(cmd, input=getpass.getpass(f"{provider} key: "), text=True)
+    else:
+        r = subprocess.run(cmd)  # macOS `security -w` with no value prompts on the terminal
+    if r.returncode == 0:
+        print(f"{provider} key {'stored in' if action == 'set' else 'removed from'} the OS keychain.", file=sys.stderr)
+    return r.returncode
+
+
 def api_key():
-    """(provider, key) or (None, None). A TypeSafe key wins over a gateway key; LIMPET_KEY_CMD is the fallback."""
+    """(provider, key) or (None, None). Environment first, then the OS keychain, then LIMPET_KEY_CMD."""
     if cfg("TYPESAFE_API_KEY"):
         return "typesafe", cfg("TYPESAFE_API_KEY")
     if cfg("AI_GATEWAY_API_KEY"):
         return "vercel", cfg("AI_GATEWAY_API_KEY")
+    provider, k = keychain_key()
+    if k:
+        return provider, k
     cmd = cfg("LIMPET_KEY_CMD")
     if cmd:
         try:
@@ -529,6 +578,9 @@ def calibrate(days=30, limit=2000, fp=0.05):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="limpet: a Stop hook backed by jev. With no subcommand, runs as the hook (JSON on stdin).")
     sub = ap.add_subparsers(dest="cmd")
+    k = sub.add_parser("key", help="store the jev key in the OS keychain")
+    k.add_argument("action", choices=["set", "rm"])
+    k.add_argument("--provider", choices=list(PROVIDERS), default="typesafe")
     for name in ("suggest", "calibrate"):
         p = sub.add_parser(name)
         p.add_argument("--days", type=int, default=30)
@@ -536,6 +588,8 @@ if __name__ == "__main__":
         if name == "calibrate":
             p.add_argument("--fp", type=float, default=0.05, help="accepted share of fine stops to block")
     a = ap.parse_args()
+    if a.cmd == "key":
+        sys.exit(key_cmd(a.action, a.provider))
     if a.cmd == "suggest":
         sys.exit(suggest(a.days, a.max))
     if a.cmd == "calibrate":

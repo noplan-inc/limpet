@@ -107,10 +107,10 @@ codex plugin marketplace add noplan-inc/limpet
 codex plugin add limpet@limpet
 ```
 
-その後 `codex` を起動して `/hooks` を開き、limpet の Stop hook を信頼する。Codex のプラグインは秘密情報を持てないので、鍵は `~/.limpet/env` に置く:
+その後 `codex` を起動して `/hooks` を開き、limpet の Stop hook を信頼する。Codex のプラグインは秘密情報を持てないので、鍵は OS のキーチェーン（macOS はキーチェーン、Linux は libsecret）に入れる。鍵を聞かれて保存され、平文ではディスクに書かれない:
 
 ```sh
-mkdir -p ~/.limpet && echo 'TYPESAFE_API_KEY=...' >> ~/.limpet/env
+python3 ~/.codex/plugins/cache/limpet/limpet/0.1.0/limpet.py key set
 ```
 
 ### 動作要件
@@ -123,7 +123,7 @@ mkdir -p ~/.limpet && echo 'TYPESAFE_API_KEY=...' >> ~/.limpet/env
 git clone https://github.com/noplan-inc/limpet ~/limpet
 ```
 
-`python3 ~/limpet/limpet.py` を走らせる `Stop` hook（timeout 30）を `~/.claude/settings.json` や `~/.codex/hooks.json` など、そのエージェントの hooks 設定に足し、鍵を `~/.limpet/env` に置く。
+`python3 ~/limpet/limpet.py` を走らせる `Stop` hook（timeout 30）を `~/.claude/settings.json` や `~/.codex/hooks.json` など、そのエージェントの hooks 設定に足し、鍵は `python3 ~/limpet/limpet.py key set` で保存する。
 
 ## ルール
 
@@ -224,12 +224,13 @@ limpet はその間にいる。ルールは任意の言語の自然言語で、�
 
 ## 設定
 
-環境変数か、`~/.limpet/env` の `KEY=VALUE` 行。Claude Code プラグインの設定項目も同じ名前に対応する。
+鍵の取得順は、環境変数（または Claude Code プラグインの設定、`~/.limpet/env` の `KEY=VALUE` 行）→ `key set` で入れた OS のキーチェーン → `LIMPET_KEY_CMD`。プラグイン設定かキーチェーンを使うこと。`~/.limpet/env` は平文で、キーチェーンの無い環境のためだけにある。
 
 | 変数 | 既定 | |
 |---|---|---|
 | `TYPESAFE_API_KEY` | | TypeSafe の鍵。`api.typesafe.ai` を直接呼ぶ |
 | `AI_GATEWAY_API_KEY` | | Vercel AI Gateway の鍵。どちらか一方でよい。両方あれば TypeSafe が優先 |
+| `key set` / `key rm` | | OS のキーチェーンに鍵を保存・削除する（Gateway の鍵は `--provider vercel`） |
 | `LIMPET_KEY_CMD` | | 鍵を出力するシェルコマンド。パスワードマネージャ用。`op read op://vault/item/password` |
 | `LIMPET_PROVIDER` | `vercel` | `typesafe` か `vercel`。`LIMPET_KEY_CMD` を使うときだけ必要 |
 | `LIMPET_BLOCK` | 未設定 | 閾。上記参照。未設定は影の運転 |

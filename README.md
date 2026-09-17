@@ -107,10 +107,10 @@ codex plugin marketplace add noplan-inc/limpet
 codex plugin add limpet@limpet
 ```
 
-Then run `codex`, open `/hooks`, and trust limpet's Stop hook. Codex plugins don't carry secrets, so put the key in `~/.limpet/env`:
+Then run `codex`, open `/hooks`, and trust limpet's Stop hook. Codex plugins don't carry secrets, so store the key in the OS keychain (macOS Keychain, or libsecret on Linux). It prompts for the key and nothing is written to disk in plain text:
 
 ```sh
-mkdir -p ~/.limpet && echo 'TYPESAFE_API_KEY=...' >> ~/.limpet/env
+python3 ~/.codex/plugins/cache/limpet/limpet/0.1.0/limpet.py key set
 ```
 
 ### Requirements
@@ -123,7 +123,7 @@ Python 3.9 or newer on `PATH` as `python3`. Tested on macOS and Linux.
 git clone https://github.com/noplan-inc/limpet ~/limpet
 ```
 
-Add a `Stop` hook running `python3 ~/limpet/limpet.py` (timeout 30) to `~/.claude/settings.json`, `~/.codex/hooks.json`, or wherever your agent keeps hooks, and put the key in `~/.limpet/env`.
+Add a `Stop` hook running `python3 ~/limpet/limpet.py` (timeout 30) to `~/.claude/settings.json`, `~/.codex/hooks.json`, or wherever your agent keeps hooks, and store the key with `python3 ~/limpet/limpet.py key set`.
 
 ## Rules
 
@@ -223,12 +223,13 @@ limpet sits in between. Rules are plain language in any language, judged by a mo
 
 ## Configuration
 
-Environment variables, or `KEY=VALUE` lines in `~/.limpet/env`. Claude Code plugin settings map to the same names.
+Where the key comes from, first match wins: the environment (or the Claude Code plugin config, or `KEY=VALUE` lines in `~/.limpet/env`), then the OS keychain written by `key set`, then `LIMPET_KEY_CMD`. Prefer the plugin config or the keychain; `~/.limpet/env` is plain text and only there for platforms without a keychain.
 
 | Variable | Default | |
 |---|---|---|
 | `TYPESAFE_API_KEY` | | TypeSafe key. Calls `api.typesafe.ai` directly |
 | `AI_GATEWAY_API_KEY` | | Vercel AI Gateway key. Either key is enough; TypeSafe wins if both are set |
+| `key set` / `key rm` | | Store or remove the key in the OS keychain (`--provider vercel` for a gateway key) |
 | `LIMPET_KEY_CMD` | | Shell command that prints the key, for password managers. `op read op://vault/item/password` |
 | `LIMPET_PROVIDER` | `vercel` | `typesafe` or `vercel`. Only needed with `LIMPET_KEY_CMD` |
 | `LIMPET_BLOCK` | unset | Thresholds, see above. Unset is shadow mode |

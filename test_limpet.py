@@ -107,9 +107,31 @@ def test_config():
     assert limpet.api_key() == ("typesafe", "ts")
     del os.environ["TYPESAFE_API_KEY"]
     os.environ.pop("AI_GATEWAY_API_KEY", None)
+    real_keychain = limpet.keychain_key
+    limpet.keychain_key = lambda: (None, None)  # isolate the test from the developer's real keychain
     os.environ["LIMPET_KEY_CMD"] = "echo from-cmd"
     os.environ["LIMPET_PROVIDER"] = "typesafe"
     assert limpet.api_key() == ("typesafe", "from-cmd")
+    limpet.keychain_key = real_keychain
+
+    # OS keychain: found => beats LIMPET_KEY_CMD; env still beats the keychain
+    real_run = limpet.subprocess.run
+
+    class R:
+        stdout, returncode = "from-keychain\n", 0
+
+    def fake_run(cmd, **kw):
+        if isinstance(cmd, list) and cmd[0] in ("security", "secret-tool"):
+            return R() if "vercel" in cmd else type("N", (), {"stdout": "", "returncode": 1})()
+        return real_run(cmd, **kw)
+    limpet.subprocess.run = fake_run
+    assert limpet.keychain_key() == ("vercel", "from-keychain")
+    assert limpet.api_key() == ("vercel", "from-keychain")
+    os.environ["TYPESAFE_API_KEY"] = "ts"
+    assert limpet.api_key() == ("typesafe", "ts")
+    del os.environ["TYPESAFE_API_KEY"]
+    assert limpet._keychain_cmd("add", "typesafe")[-1] == "-w" if sys.platform == "darwin" else True  # prompts, key never in argv
+    limpet.subprocess.run = real_run
     del os.environ["LIMPET_KEY_CMD"], os.environ["LIMPET_PROVIDER"]
 
     rs = ["Run the tests, then, only then, say done", "Run the tests, then, only then, report it", "Answer in Japanese"]
