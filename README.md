@@ -168,7 +168,26 @@ It finds every place an agent stopped and you replied, asks jev how you reacted 
 
 ## Thresholds
 
-Start in **shadow mode**: no thresholds set. Every stop is scored and logged to `~/.limpet/log.jsonl`, nothing is blocked. After a day or two:
+You don't have to wait for data either. `calibrate` scores your current `rules.md` against the same past stops and prints the thresholds:
+
+```sh
+python3 ~/limpet/limpet.py calibrate          # --fp 0.10 to accept 10% false positives instead of 5%
+```
+
+```
+1500 scored in 198 s: 597 stops the human pushed back on, 903 fine.
+
+ AUROC   thr  catches  rule
+  0.62  0.42     18%  Fix problems you find before stopping …
+  0.60  0.49     10%  Don't ask "shall I start?" …
+  0.50  0.41      8%  Don't say "done" without running the tests   (does not separate; left in shadow)
+
+LIMPET_BLOCK="Fix problems=0.42,Don't ask=0.49,…"
+```
+
+AUROC is how well the rule separates stops you pushed back on from stops you were fine with (0.5 is a coin toss). A rule below 0.55 is left out of `LIMPET_BLOCK`; it stays in `rules.md` and keeps being logged. Copy the last line into your settings.
+
+Or start in **shadow mode**: no thresholds set. Every stop is scored and logged to `~/.limpet/log.jsonl`, nothing is blocked. After a day or two:
 
 ```sh
 python3 ~/limpet/limpet.py --stats

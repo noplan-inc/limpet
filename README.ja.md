@@ -168,7 +168,26 @@ python3 ~/limpet/limpet.py suggest            # 直近 30 日。--days 90 --max 
 
 ## 閾
 
-まず**影の運転**から始める。閾は未設定。全停止が採点されて `~/.limpet/log.jsonl` に記録されるだけで、何も止めない。1〜2 日回したら:
+データが溜まるのを待つ必要もない。`calibrate` が今の `rules.md` を同じ過去の停止で採点して、閾を出す:
+
+```sh
+python3 ~/limpet/limpet.py calibrate          # --fp 0.10 で誤検知 5% の代わりに 10% を許す
+```
+
+```
+1500 scored in 198 s: 597 stops the human pushed back on, 903 fine.
+
+ AUROC   thr  catches  rule
+  0.62  0.42     18%  見つけた問題は直してから止まる …
+  0.60  0.49     10%  既に依頼された作業に「始めますか？」と許可を取らない …
+  0.52  0.44      5%  テストを走らせずに「完了」と言わない   (does not separate; left in shadow)
+
+LIMPET_BLOCK="見つけた問題=0.42,既に依頼され=0.49,…"
+```
+
+AUROC は「あなたが押し戻した停止」と「問題なかった停止」をそのルールがどれだけ分けられるか（0.5 はコイン投げ）。0.55 未満のルールは `LIMPET_BLOCK` から外れるが、`rules.md` には残ってログは取り続ける。最後の行を設定にコピーする。
+
+あるいは、まず**影の運転**から始める。閾は未設定。全停止が採点されて `~/.limpet/log.jsonl` に記録されるだけで、何も止めない。1〜2 日回したら:
 
 ```sh
 python3 ~/limpet/limpet.py --stats

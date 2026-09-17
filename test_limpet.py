@@ -157,10 +157,33 @@ def test_suggest():
     assert os.path.exists(os.path.join(TMP, "suggest.md"))
 
 
+def test_calibrate():
+    rules = limpet.load_rules()
+    assert limpet.block_key(rules[0], rules) and all(limpet.block_key(rules[0], rules) not in r for r in rules[1:])
+    assert limpet.auroc([0.9, 0.8], [0.1, 0.2]) == 1.0 and limpet.auroc([0.5], [0.5]) == 0.5
+    stops = [{"context": [], "tools": [], "last": f"stop {i}", "next": "do it" if i % 2 else "thanks", "ts": str(i)} for i in range(20)]
+    limpet.transcript_files = lambda days: ["x"]
+    limpet.scan = lambda path: stops
+    # rule 0 separates bad stops perfectly, rule 1 is noise
+    limpet.call = lambda body, key, provider: {"answers": {
+        **{f"r{i}": {"probability": (0.9 if "do it" in body["state"]["what the human said next"] else 0.1) if i == 0 else 0.5}
+           for i in range(len(rules))},
+        "reaction": {"choice": "push" if "do it" in body["state"]["what the human said next"] else "ack"}}}
+    os.environ["AI_GATEWAY_API_KEY"] = "test"
+    out = io.StringIO()
+    sys.stdout = out
+    assert limpet.calibrate(days=1, limit=100) == 0
+    sys.stdout = sys.__stdout__
+    text = out.getvalue()
+    assert "10 stops the human pushed back on, 10 fine" in text and "  1.00  0.10    100%" in text, text
+    assert "LIMPET_BLOCK=" in text and "=0.10" in text and "does not separate" in text, text
+
+
 if __name__ == "__main__":
     claude_path = test_claude_transcript()
     test_codex_transcript()
     rules = test_config_and_request()
     test_block_path(claude_path, rules)
     test_suggest()
+    test_calibrate()
     print("ok")

@@ -9,6 +9,7 @@ rule is over its threshold, the hook exits 2 with a message telling the agent to
     echo '{"transcript_path": "...", "stop_hook_active": false}' | python3 limpet.py
     python3 limpet.py --stats      # per-rule percentiles from the log, to pick thresholds
     python3 limpet.py suggest      # mine your transcripts for the rules you actually need
+    python3 limpet.py calibrate    # score rules.md against your transcripts and print LIMPET_BLOCK
 
 Configuration, in order of precedence: environment, then ~/.limpet/env (KEY=VALUE lines).
     TYPESAFE_API_KEY    TypeSafe key (https://console.typesafe.ai/keys) => calls api.typesafe.ai directly.
@@ -465,13 +466,91 @@ def _oneline(s, n=110):
     return s if len(s) <= n else s[:n] + "…"
 
 
+# --- calibrate: pick thresholds from your own transcripts ---
+
+def score(stop, rules, key, provider):
+    """Rule probabilities for one past stop plus how the human reacted, in one jev call."""
+    url, model, qtype, field = PROVIDERS[provider]
+    state = {"previous messages (newest first)": stop["context"], "tool calls this turn (oldest first)": stop["tools"],
+             "agent's final message before stopping": stop["last"]}
+    qs = {f"r{i}": {"type": qtype, "instructions": f"Is the agent violating this rule? Rule: {r}"} for i, r in enumerate(rules)}
+    qs["reaction"] = {"type": "choice", "instructions": "How did the human react to the agent's final message?", "criteria": REACTIONS}
+    body = {"state": {**state, "what the human said next": stop["next"]}, "questions": qs}
+    if provider == "typesafe":
+        body["model"] = cfg("LIMPET_JEV_MODEL", model)
+    try:
+        ans = call(body, key, provider)["answers"]
+        rx = ans["reaction"]
+        return {"probs": [ans[f"r{i}"].get(field) for i in range(len(rules))],
+                "bad": (rx.get("choice") or max(rx["probabilities"], key=rx["probabilities"].get)) in ("push", "correction")}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+def auroc(pos, neg):
+    if not pos or not neg:
+        return float("nan")
+    return sum((p > n) + 0.5 * (p == n) for p in pos for n in neg) / (len(pos) * len(neg))
+
+
+def block_key(rule, rules):
+    """Shortest prefix of the rule that no other rule contains, for LIMPET_BLOCK."""
+    for n in range(6, len(rule) + 1):
+        k = rule[:n]
+        if not any(k in r for r in rules if r != rule):
+            return k
+    return rule
+
+
+def calibrate(days=30, limit=2000, fp=0.05):
+    from concurrent.futures import ThreadPoolExecutor
+    load_env()
+    provider, key = api_key()
+    if not key:
+        print("limpet calibrate needs a jev key (TYPESAFE_API_KEY or AI_GATEWAY_API_KEY).", file=sys.stderr)
+        return 1
+    rules = load_rules()
+    files = transcript_files(days)
+    stops = sorted((s for p in files for s in scan(p)), key=lambda s: s["ts"], reverse=True)[:limit]
+    print(f"{len(stops)} stops from {len(files)} transcripts (last {days} days), {len(rules)} rules. Asking jev...", file=sys.stderr)
+    t0 = time.time()
+    with ThreadPoolExecutor(8) as ex:
+        results = [r for r in ex.map(lambda s: score(s, rules, key, provider), stops) if "error" not in r]
+    bad = [r for r in results if r["bad"]]
+    good = [r for r in results if not r["bad"]]
+    print(f"{len(results)} scored in {int(time.time() - t0)} s: {len(bad)} stops the human pushed back on, {len(good)} fine.\n")
+    print(f"{'AUROC':>6} {'thr':>5} {'catches':>8}  rule")
+    spec = []
+    for i, rule in enumerate(rules):
+        pos = [r["probs"][i] for r in bad if r["probs"][i] is not None]
+        neg = sorted(r["probs"][i] for r in good if r["probs"][i] is not None)
+        if not pos or not neg:
+            continue
+        a = auroc(pos, neg)
+        thr = neg[min(len(neg) - 1, int((1 - fp) * len(neg)))]
+        catch = sum(p >= thr for p in pos) / len(pos)
+        mark = "" if a >= 0.55 else "   (does not separate; left in shadow)"
+        print(f"{a:6.2f} {thr:5.2f} {catch:7.0%}  {rule[:70]}{mark}")
+        if a >= 0.55:
+            spec.append(f"{block_key(rule, rules)}={thr:.2f}")
+    print(f"\nthr = the value that blocks {fp:.0%} of your fine stops; catches = share of bad stops at or above it.")
+    if spec:
+        print(f"\nLIMPET_BLOCK=\"{','.join(spec)}\"")
+    else:
+        print("\nNo rule separates your bad stops from your fine ones yet. Rewrite the rules to describe what the agent says, not what it did wrong.")
+    return 0
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if "--stats" in args:
         stats()
-    elif args and args[0] == "suggest":
+    elif args and args[0] in ("suggest", "calibrate"):
         days = int(args[args.index("--days") + 1]) if "--days" in args else 30
         limit = int(args[args.index("--max") + 1]) if "--max" in args else 2000
-        sys.exit(suggest(days, limit))
+        if args[0] == "suggest":
+            sys.exit(suggest(days, limit))
+        fp = float(args[args.index("--fp") + 1]) if "--fp" in args else 0.05
+        sys.exit(calibrate(days, limit, fp))
     else:
         sys.exit(main())
