@@ -135,7 +135,6 @@ On first run limpet copies its default rules to `~/.limpet/rules.md`. Edit that 
 - Don't hand work to the human unless only a human can do it
 - Fix problems you find before stopping. Don't stop at "CI is failing"
 - When waiting, give a time estimate
-- テストを走らせずに「完了」と言わない
 ```
 
 The [default rules](rules.md) are the ten that the author's agents actually break.
