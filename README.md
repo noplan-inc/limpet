@@ -195,6 +195,24 @@ Without `LIMPET_BLOCK` set, limpet runs in **shadow mode**: every stop is scored
 
 `LIMPET_BLOCK` is one number for every rule, or a comma list of `substring of the rule=threshold`. Rules without a threshold never block.
 
+## How well does it work
+
+Honest numbers, measured on the author's own 40 days of Claude Code and Codex transcripts (2,645 stops the human replied to, after removing automation noise). A stop is "bad" when jev classifies the human's reply as pushing the agent on or correcting it, and the failure type is jev's too, so the labels are noisy and these numbers are a floor.
+
+| Failure type (n) | Rule | AUROC | Caught at 5% false positives |
+|---|---|---|---|
+| handoff (646) | Don't hand work to the human | 0.62 | 8% |
+| handoff | Don't ask "shall I start?" | 0.60 | 5% |
+| handoff | try another way / fix before stopping / give an estimate | 0.57–0.58 | 6–8% |
+| overreach (178) | Don't stop to offer things that weren't asked for | 0.60 | 12% |
+| overreach | Don't widen the scope | 0.59 | 9% |
+| misread (30) | Don't confuse a proposal with a request to act | 0.64 | 10% |
+| taste (100) | Answer in the human's language | 0.51 | no signal |
+
+0.5 is a coin toss. So: at a threshold that blocks 5% of fine stops, limpet catches 5–12% of the bad stops of that type, one to two and a half times what random blocking would. It is a cheap nudge, not a wall. On a smaller set labeled carefully by a large model the same rules scored 0.62–0.70, so the ceiling is probably around 0.65 with the information a stop has.
+
+What it cannot see at all: a success report that CI later disproves, a fix that is simply wrong, the wrong repo, stale state, taste. Those were 33% of the author's bad stops. `suggest` tells you your own split.
+
 ## Compared to
 
 Other Stop hooks that push the agent back fall into two camps.
