@@ -56,6 +56,7 @@ NOT_HUMAN_PREFIXES = (
     "Stop hook feedback:", "Caveat: The messages below", "API Error",
     "The previous response failed to produce a valid tool call",
     "# AGENTS.md instructions", "<environment_context", "<user_instructions", "<permissions instructions",
+    "The following is the Codex agent history",  # Codex approval automations
 )
 
 
@@ -374,8 +375,12 @@ def scan(path):
 
 def past_stops(days, limit):
     files = transcript_files(days)
-    stops = sorted((s for p in files for s in scan(p)), key=lambda s: s["ts"], reverse=True)[:limit]
-    return files, stops
+    stops = [s for p in files for s in scan(p)]
+    seen = {}
+    for s in stops:  # a long reply repeated verbatim is a template from an automation, not a human reacting
+        seen[s["next"][:200]] = seen.get(s["next"][:200], 0) + 1
+    stops = [s for s in stops if len(s["next"]) <= 80 or seen[s["next"][:200]] < 5]
+    return files, sorted(stops, key=lambda s: s["ts"], reverse=True)[:limit]
 
 
 def reaction_question(stop):

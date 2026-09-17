@@ -172,6 +172,10 @@ def test_suggest_and_calibrate():
     ])
     stops = limpet.scan(path)
     assert [s["next"] for s in stops] == ["do it", "thanks", "do it"], stops  # a repeated short reply is not a duplicate
+    tpl = write([x for _ in range(5) for x in (claude_line("assistant", "report"), claude_line("user", "【bot】" + "daily report template " * 5))]
+                + [claude_line("assistant", "report"), claude_line("user", "The following is the Codex agent history since your last check")])
+    limpet.transcript_files = lambda days: [tpl]
+    assert limpet.past_stops(1, 100)[1] == []  # a template repeated 5 times and an automation injection are not humans
     assert stops[0]["tools"] == ["Edit: auth.py → ok"] and stops[0]["context"] == ["fix the login bug"], stops[0]
     limpet.transcript_files = lambda days: [path]
     os.environ["AI_GATEWAY_API_KEY"] = "test"
