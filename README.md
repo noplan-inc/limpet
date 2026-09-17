@@ -93,7 +93,7 @@ A stop is one call with one yes/no question per rule, 1,000 to 2,000 input token
 /plugin install limpet@limpet
 ```
 
-Claude Code asks for your key and thresholds on install (they go to secure storage, not to `settings.json`). Or from the shell:
+Claude Code asks for your key and thresholds on install. The key goes to secure storage, not to `settings.json`. Or from the shell:
 
 ```sh
 claude plugin marketplace add noplan-inc/limpet
@@ -107,11 +107,14 @@ codex plugin marketplace add noplan-inc/limpet
 codex plugin add limpet@limpet
 ```
 
-Then run `codex`, open `/hooks`, and trust limpet's Stop hook. Codex plugins don't carry secrets, so store the key in the OS keychain (macOS Keychain, or libsecret on Linux). It prompts for the key and nothing is written to disk in plain text:
+Then run `codex`, open `/hooks`, and trust limpet's Stop hook. Codex plugins don't carry secrets, so store the key in the OS keychain (macOS Keychain, or libsecret on Linux). Any copy of `limpet.py` can do it, since the keychain entry is machine-wide; a clone is the easiest to find again:
 
 ```sh
-python3 ~/.codex/plugins/cache/limpet/limpet/0.1.0/limpet.py key set
+git clone https://github.com/noplan-inc/limpet ~/limpet
+python3 ~/limpet/limpet.py key set        # prompts for the key; nothing is written in plain text
 ```
+
+The clone is also what you run `suggest` and `calibrate` from below.
 
 ### Requirements
 
@@ -144,6 +147,7 @@ The [default rules](rules.md) are the ten that the author's agents actually brea
 You don't have to guess which rules you need. limpet can read your own transcripts and tell you:
 
 ```sh
+git clone https://github.com/noplan-inc/limpet ~/limpet   # the command-line tools run from a clone
 python3 ~/limpet/limpet.py suggest            # last 30 days; --days 90 --max 5000 to go wider
 ```
 
@@ -188,7 +192,7 @@ python3 ~/limpet/limpet.py calibrate          # --fp 0.10 to accept 10% false po
 LIMPET_BLOCK="Fix problems=0.42,Don't ask=0.49,…"
 ```
 
-AUROC is how well the rule separates stops you pushed back on from stops you were fine with (0.5 is a coin toss). `blocks` is the share of fine stops the threshold actually blocks, which can exceed the target when many stops tie. A rule below 0.55 is left out of `LIMPET_BLOCK`; it stays in `rules.md` and keeps being logged. Copy the last line into your settings.
+AUROC is how well the rule separates stops you pushed back on from stops you were fine with (0.5 is a coin toss). `blocks` is the share of fine stops the threshold actually blocks, which can exceed the target when many stops tie. A rule below 0.55 is left out of `LIMPET_BLOCK`; it stays in `rules.md` and keeps being logged. Copy the last line into the `env` block of `settings.json` or `~/.limpet/env`; with the Claude Code plugin, paste the value into its `block` setting under `/plugin`. This example is a different run from the `suggest` example above, so the counts differ.
 
 Without `LIMPET_BLOCK` set, limpet runs in **shadow mode**: every stop is scored and logged to `~/.limpet/log.jsonl`, nothing is blocked.
 
@@ -196,17 +200,17 @@ Without `LIMPET_BLOCK` set, limpet runs in **shadow mode**: every stop is scored
 
 ## How well does it work
 
-Honest numbers, measured on the author's own 40 days of Claude Code and Codex transcripts (2,645 stops the human replied to, after removing automation noise). A stop is "bad" when jev classifies the human's reply as pushing the agent on or correcting it, and the failure type is jev's too, so the labels are noisy and these numbers are a floor.
+Honest numbers (rule names as in the bundled `rules.md`), measured on the author's own 40 days of Claude Code and Codex transcripts (2,645 stops the human replied to, after removing automation noise). A stop is "bad" when jev classifies the human's reply as pushing the agent on or correcting it, and the failure type is jev's too, so the labels are noisy and these numbers are a floor.
 
 | Failure type (n) | Rule | AUROC | Caught at 5% false positives |
 |---|---|---|---|
 | handoff (646) | Don't hand work to the human | 0.62 | 8% |
-| handoff | Don't ask "shall I start?" | 0.60 | 5% |
-| handoff | try another way / fix before stopping / give an estimate | 0.57–0.58 | 6–8% |
+| handoff | Don't ask "shall I start?" for work that was already requested | 0.60 | 5% |
+| handoff | Fix problems you find before stopping / When waiting, give a time estimate | 0.57–0.58 | 6–8% |
 | overreach (178) | Don't stop to offer things that weren't asked for | 0.60 | 12% |
-| overreach | Don't widen the scope | 0.59 | 9% |
+| overreach | Don't edit files outside the scope of the task | 0.59 | 9% |
 | misread (30) | Don't confuse a proposal with a request to act | 0.64 | 10% |
-| taste (100) | Answer in the human's language | 0.51 | no signal |
+| taste (100) | Answer in the language the human writes in | 0.51 | no signal |
 
 0.5 is a coin toss. So: at a threshold that blocks 5% of fine stops, limpet catches 5–12% of the bad stops of that type, one to two and a half times what random blocking would. It is a cheap nudge, not a wall. On a smaller set labeled carefully by a large model the same rules scored 0.62–0.70, so the ceiling is probably around 0.65 with the information a stop has.
 
@@ -223,13 +227,12 @@ limpet sits in between. Rules are plain language in any language, judged by a mo
 
 ## Configuration
 
-Where the key comes from, first match wins: the environment (or the Claude Code plugin config, or `KEY=VALUE` lines in `~/.limpet/env`), then the OS keychain written by `key set`, then `LIMPET_KEY_CMD`. Prefer the plugin config or the keychain; `~/.limpet/env` is plain text and only there for platforms without a keychain.
+Where the key comes from, first match wins: the environment (or the Claude Code plugin config, or `KEY=VALUE` lines in `~/.limpet/env`), then the OS keychain written by `key set`, then `LIMPET_KEY_CMD`. Prefer the plugin config or the keychain; `~/.limpet/env` is plain text and only there for platforms without a keychain. `python3 limpet.py key set` stores the key (`--provider vercel` for a gateway key), `key rm` removes it, and `LIMPET_DEBUG=1` prints the traceback the hook otherwise swallows.
 
 | Variable | Default | |
 |---|---|---|
 | `TYPESAFE_API_KEY` | | TypeSafe key. Calls `api.typesafe.ai` directly |
 | `AI_GATEWAY_API_KEY` | | Vercel AI Gateway key. Either key is enough; TypeSafe wins if both are set |
-| `key set` / `key rm` | | Store or remove the key in the OS keychain (`--provider vercel` for a gateway key) |
 | `LIMPET_KEY_CMD` | | Shell command that prints the key, for password managers. `op read op://vault/item/password` |
 | `LIMPET_PROVIDER` | `vercel` | `typesafe` or `vercel`. Only needed with `LIMPET_KEY_CMD` |
 | `LIMPET_BLOCK` | unset | Thresholds, see above. Unset is shadow mode |

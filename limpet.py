@@ -11,20 +11,12 @@ violated. If a rule is over its threshold, the hook exits 2 with a message telli
     python3 limpet.py suggest      # mine your transcripts for the rules you actually need
     python3 limpet.py calibrate    # score rules.md against your transcripts and print LIMPET_BLOCK
 
-Where the key comes from, first match wins: TYPESAFE_API_KEY / AI_GATEWAY_API_KEY in the environment, the
-Claude Code plugin config (CLAUDE_PLUGIN_OPTION_*) or ~/.limpet/env; then the OS keychain (`key set`); then
-LIMPET_KEY_CMD.
-    TYPESAFE_API_KEY    TypeSafe key (https://console.typesafe.ai/keys) => calls api.typesafe.ai directly.
-    AI_GATEWAY_API_KEY  Vercel AI Gateway key => calls jev through the gateway. Either key is enough.
-    LIMPET_KEY_CMD      a shell command that prints the key, if you keep it in a password manager.
-    LIMPET_PROVIDER     "typesafe" or "vercel". Only needed with LIMPET_KEY_CMD (default vercel).
-    LIMPET_BLOCK        "0.8" (one threshold for all rules) or "run the tests=0.5,hand work=0.6"
-                        (a substring of the rule text => its threshold). Unset = shadow mode: log, never block.
-    LIMPET_RULES        rules file (default: ~/.limpet/rules.md, created from the bundled rules.md on first run)
-    LIMPET_LOG          log file (default: ~/.limpet/log.jsonl)
-    LIMPET_JEV_MODEL    default jev-latest (TypeSafe) / typesafe-ai/jev (Vercel)
+Key lookup, first match wins: TYPESAFE_API_KEY / AI_GATEWAY_API_KEY from the environment, the Claude Code plugin
+config (CLAUDE_PLUGIN_OPTION_*) or ~/.limpet/env; then the OS keychain (`key set`); then LIMPET_KEY_CMD.
+All settings (LIMPET_BLOCK, LIMPET_RULES, LIMPET_LOG, ...) are listed in README.md, "Configuration".
 
-No key, API down, timeout, or any other error => exit 0 silently. A hook must never stop the work.
+No key, API down, timeout, or any other error => exit 0 silently (LIMPET_DEBUG=1 prints the traceback).
+A hook must never stop the work.
 """
 import argparse
 import glob
@@ -44,22 +36,20 @@ PROVIDERS = {  # url, model, yes/no question type, answer field
     "typesafe": ("https://api.typesafe.ai/v1/systemone", "jev-latest", "noul", "noul"),
     "vercel": ("https://ai-gateway.vercel.sh/v4/ai/evaluation-model", "typesafe-ai/jev", "boolean", "probability"),
 }
-TIMEOUT = 20  # jev call; the key command gets 8 s, so both fit in the hook's 30 s
-TAIL_BYTES = 512 * 1024  # only the tail of the transcript is read
+TIMEOUT = 20  # jev call. Worst case before it: keychain 2 s + LIMPET_KEY_CMD 8 s => 30 s, the hook's budget
+TAIL_BYTES = 512 * 1024  # the hook reads only the tail of the transcript
+SCAN_BYTES = 4 * 1024 * 1024  # suggest/calibrate read this much per transcript
 N_CONTEXT = 3  # previous messages sent as context
 MAXLEN = 2000  # per message
 MAX_TOOLS = 40  # tool calls of the current turn, most recent kept
 
 # user lines that look human but are injected by the harness (collected from real transcripts)
 NOT_HUMAN_PREFIXES = (
-    "<teammate-message", "<system-reminder", "<command-name>", "<command-message", "<local-command-caveat",
-    "<local-command-stdout", "<user-prompt-submit-hook", "Another Claude session sent",
-    "The coordinator sent a message", "[SYSTEM NOTIFICATION", "[Request interrupted", "[Image:",
-    "Stop hook feedback:", "Caveat: The messages below", "API Error",
-    "The previous response failed to produce a valid tool call",
-    "# AGENTS.md instructions", "<environment_context", "<user_instructions", "<permissions instructions",
+    "Another Claude session sent", "The coordinator sent a message", "[SYSTEM NOTIFICATION", "[Request interrupted",
+    "[Image:", "Stop hook feedback:", "Caveat: The messages below", "API Error",
+    "The previous response failed to produce a valid tool call", "# AGENTS.md instructions",
     "The following is the Codex agent history",  # Codex approval automations
-)
+)  # anything starting with an XML-ish tag (<system-reminder>, <environment_context>, ...) is dropped by regex
 
 
 # --- config ---
@@ -120,8 +110,10 @@ def keychain_key():
         if not cmd:
             return None, None
         try:
-            k = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout.strip()
-        except (OSError, subprocess.SubprocessError):
+            k = subprocess.run(cmd, capture_output=True, text=True, timeout=2).stdout.strip()
+        except subprocess.TimeoutExpired:  # no keychain daemon (headless Linux): don't pay it twice
+            return None, None
+        except (OSError, subprocess.SubprocessError, ValueError):
             k = ""
         if k:
             return provider, k
@@ -136,9 +128,9 @@ def key_cmd(action, provider):
         return 1
     if action == "set" and sys.platform.startswith("linux"):
         import getpass
-        r = subprocess.run(cmd, input=getpass.getpass(f"{provider} key: "), text=True)
+        r = subprocess.run(cmd, input=getpass.getpass(f"{provider} key: "), text=True, timeout=60)
     else:
-        r = subprocess.run(cmd)  # macOS `security -w` with no value prompts on the terminal
+        r = subprocess.run(cmd, timeout=60)  # macOS `security -w` with no value prompts on the terminal
     if r.returncode == 0:
         print(f"{provider} key {'stored in' if action == 'set' else 'removed from'} the OS keychain.", file=sys.stderr)
     return r.returncode
@@ -157,30 +149,34 @@ def api_key():
     if cmd:
         try:
             k = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=8).stdout.strip()
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, ValueError):
             k = None
         if k:
             return cfg("LIMPET_PROVIDER", "vercel"), k
     return None, None
 
 
-def threshold(rule):
-    """LIMPET_BLOCK => threshold for this rule. Malformed parts are ignored, never fatal."""
+def thresholds():
+    """LIMPET_BLOCK => (default for every rule, {substring: threshold}). Malformed parts are ignored, never fatal."""
     spec = (cfg("LIMPET_BLOCK") or "").strip()
-    if not spec:
-        return float("inf")
     try:
-        return float(spec)
+        return float(spec), {}
     except ValueError:
         pass
+    out = {}
     for part in spec.split(","):
         k, _, v = part.rpartition("=")
         try:
-            if k.strip() and k.strip() in rule:
-                return float(v)
+            if k.strip():
+                out[k.strip()] = float(v)
         except ValueError:
             continue
-    return float("inf")
+    return float("inf"), out
+
+
+def threshold(rule, spec=None):
+    default, keyed = spec or thresholds()
+    return next((t for k, t in keyed.items() if k in rule), default)
 
 
 # --- transcripts (Claude Code and Codex CLI) ---
@@ -260,9 +256,7 @@ def tools_since_turn(rows):
             if d.get("type") == "assistant" and b.get("type") == "tool_use":
                 uses.append((b.get("id"), tool_line(b.get("name"), b.get("input"))))
             elif d.get("type") == "user" and b.get("type") == "tool_result":
-                results[b.get("tool_use_id")] = ("rejected" if d.get("toolDenialKind") == "user-rejected"
-                                                 else "denied" if d.get("toolDenialKind")
-                                                 else "error" if b.get("is_error") else "ok")
+                results[b.get("tool_use_id")] = "denied" if d.get("toolDenialKind") else "error" if b.get("is_error") else "ok"
     return [f"{line} → {results[i]}" if i in results else line for i, line in uses][-MAX_TOOLS:]
 
 
@@ -276,15 +270,20 @@ def _rows(text):
     return rows
 
 
-def read_tail(path):
-    """(previous messages newest first, final assistant message, tool calls of this turn)."""
+def tail_rows(path, nbytes=TAIL_BYTES):
+    """Parsed rows from the last nbytes of a transcript (the cut first line dropped)."""
     with open(path, "rb") as f:
-        start = max(0, os.path.getsize(path) - TAIL_BYTES)
+        start = max(0, os.path.getsize(path) - nbytes)
         f.seek(start)
         text = f.read().decode("utf-8", "replace")
     if start:  # the first line is cut mid-way
         text = text.split("\n", 1)[-1]
-    rows = _rows(text)
+    return _rows(text)
+
+
+def read_tail(path):
+    """(previous messages newest first, final assistant message, tool calls of this turn)."""
+    rows = tail_rows(path)
     texts = [s for d in rows for s in [assistant_text(d) or human_text(d)] if s]
     if not texts:
         return [], None, []
@@ -351,16 +350,20 @@ def main():
     except Exception as e:  # noqa: BLE001  never block on API trouble
         res, ans = {"error": str(e)[:300]}, {}
     probs = {r: prob(ans.get(f"r{i}"), provider) for i, r in enumerate(rules)}
-    hits = [(r, p) for r, p in probs.items() if p is not None and p >= threshold(r)]
+    spec = thresholds()
+    hits = [(r, p) for r, p in probs.items() if p is not None and p >= threshold(r, spec)]
     log = os.path.expanduser(cfg("LIMPET_LOG", os.path.join(HOME, "log.jsonl")))
     rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "agent": "codex" if "turn_id" in hook else "claude", "provider": provider,
            "session_id": hook.get("session_id"), "cwd": hook.get("cwd"), "transcript_path": hook.get("transcript_path"),
            "ms": int((time.time() - t0) * 1000), "usage": res.get("usage"), "error": res.get("error"), "probs": probs,
            "blocked": [r for r, _ in hits], "n_tools": len(tools), "assistant_text": last[:500]}
-    if os.path.dirname(log):
-        os.makedirs(os.path.dirname(log), exist_ok=True)
-    with open(log, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    try:
+        if os.path.dirname(log):
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:  # a full disk must not silence the block
+        pass
     if hits:
         print("limpet: this response may violate: " + "; ".join(f'"{r}" ({p:.0%})' for r, p in hits)
               + ". If it does, follow the rule and keep working. If it does not, say why in one line, then stop.",
@@ -402,8 +405,7 @@ def transcript_files(days):
 
 def scan(path):
     """Every (agent stop, what the human said next) pair in one transcript, with context and tools."""
-    with open(path, encoding="utf-8", errors="replace") as f:
-        rows = _rows(f.read())
+    rows = tail_rows(path, SCAN_BYTES)  # a session can be tens of MB; the last few MB hold plenty of stops
     texts = []  # (row index, "a"|"h", text)
     for i, d in enumerate(rows):
         a = assistant_text(d)
@@ -439,17 +441,14 @@ def reaction_question(stop):
 
 
 def ask_all(fn, stops):
-    with ThreadPoolExecutor(8) as ex:
-        return [(s, r) for s, r in zip(stops, ex.map(fn, stops)) if "error" not in r]
-
-
-def _safe(fn):
-    def wrapped(stop):
+    """fn on every stop, 8 at a time; stops whose call failed are dropped."""
+    def safe(stop):
         try:
             return fn(stop)
-        except Exception as e:  # noqa: BLE001
-            return {"error": str(e)[:200]}
-    return wrapped
+        except Exception:  # noqa: BLE001
+            return None
+    with ThreadPoolExecutor(8) as ex:
+        return [(s, r) for s, r in zip(stops, ex.map(safe, stops)) if r is not None]
 
 
 def _oneline(s, n=110):
@@ -474,7 +473,7 @@ def suggest(days=30, limit=2000):
         ans = call(_state(stop["context"], stop["last"], stop["tools"]), qs, key, provider)["answers"]
         return {q: choice(ans[q]) for q in qs}
 
-    ok = ask_all(_safe(classify), stops)
+    ok = ask_all(classify, stops)
     bad = [(s, r) for s, r in ok if r["reaction"][0] in ("push", "correction")]
     bundled = load_rules(os.path.join(HERE, "rules.md"))
     lines = ["# limpet suggest", "",
@@ -520,14 +519,14 @@ def auroc(pos, neg):
 
 
 def block_key(rule, rules):
-    """Shortest prefix of the rule that no other rule contains and that LIMPET_BLOCK can parse (no ',' or '=')."""
+    """Shortest prefix of the rule that no other rule contains and that LIMPET_BLOCK can parse (no ',' or '='), or None."""
     for n in range(6, len(rule) + 1):
         k = rule[:n]
         if "," in k or "=" in k:
-            break
+            return None
         if not any(k in r for r in rules if r != rule):
             return k
-    return re.sub(r"[,=].*", "", rule)[:30]
+    return None
 
 
 def calibrate(days=30, limit=2000, fp=0.05):
@@ -547,7 +546,7 @@ def calibrate(days=30, limit=2000, fp=0.05):
         return {"probs": [prob(ans.get(f"r{i}"), provider) for i in range(len(rules))],
                 "bad": choice(ans["reaction"])[0] in ("push", "correction")}
 
-    results = [r for _, r in ask_all(_safe(score), stops)]
+    results = [r for _, r in ask_all(score, stops)]
     bad = [r for r in results if r["bad"]]
     good = [r for r in results if not r["bad"]]
     print(f"{len(results)} scored in {int(time.time() - t0)} s: {len(bad)} stops the human pushed back on, {len(good)} fine.\n")
@@ -564,8 +563,11 @@ def calibrate(days=30, limit=2000, fp=0.05):
         blocks = sum(n >= thr for n in neg) / len(neg)  # can exceed fp when many fine stops tie at thr
         mark = "" if a >= 0.55 else "   (does not separate; left in shadow)"
         print(f"{a:6.2f} {thr:5.2f} {catch:7.0%} {blocks:7.0%}  {rule[:70]}{mark}")
-        if a >= 0.55:
-            spec.append(f"{block_key(rule, rules)}={thr:.2f}")
+        key_ = block_key(rule, rules)
+        if a >= 0.55 and key_:
+            spec.append(f"{key_}={thr:.2f}")
+        elif a >= 0.55:
+            print("       (no unique key for LIMPET_BLOCK: reword the start of this rule)")
     print(f"\nthr = the value that blocks about {fp:.0%} of your fine stops; catches = share of bad stops at or above it; "
           "blocks = share of fine stops actually at or above it.")
     if spec:
@@ -587,7 +589,7 @@ if __name__ == "__main__":
         p.add_argument("--max", type=int, default=2000)
         if name == "calibrate":
             p.add_argument("--fp", type=float, default=0.05, help="accepted share of fine stops to block")
-    a = ap.parse_args()
+    a = ap.parse_args() if sys.argv[1:2] and sys.argv[1] in ("key", "suggest", "calibrate", "-h", "--help") else argparse.Namespace(cmd=None)
     if a.cmd == "key":
         sys.exit(key_cmd(a.action, a.provider))
     if a.cmd == "suggest":
@@ -597,4 +599,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception:  # noqa: BLE001  a hook must never stop the work
+        if os.environ.get("LIMPET_DEBUG"):
+            import traceback
+            traceback.print_exc()
         sys.exit(0)

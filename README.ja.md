@@ -93,7 +93,7 @@ jev の鍵が要る。どちらか一方で動く:
 /plugin install limpet@limpet
 ```
 
-インストール時に Claude Code が鍵と閾を聞く（鍵はセキュアストレージに入り、`settings.json` には書かれない）。シェルからなら:
+インストール時に Claude Code が鍵と閾を聞く。鍵はセキュアストレージに入り、`settings.json` には書かれない。シェルからなら:
 
 ```sh
 claude plugin marketplace add noplan-inc/limpet
@@ -107,11 +107,14 @@ codex plugin marketplace add noplan-inc/limpet
 codex plugin add limpet@limpet
 ```
 
-その後 `codex` を起動して `/hooks` を開き、limpet の Stop hook を信頼する。Codex のプラグインは秘密情報を持てないので、鍵は OS のキーチェーン（macOS はキーチェーン、Linux は libsecret）に入れる。鍵を聞かれて保存され、平文ではディスクに書かれない:
+その後 `codex` を起動して `/hooks` を開き、limpet の Stop hook を信頼する。Codex のプラグインは秘密情報を持てないので、鍵は OS のキーチェーン（macOS はキーチェーン、Linux は libsecret）に入れる。キーチェーンの項目はマシン共通なので `limpet.py` はどのコピーからでもよく、clone が一番見つけやすい:
 
 ```sh
-python3 ~/.codex/plugins/cache/limpet/limpet/0.1.0/limpet.py key set
+git clone https://github.com/noplan-inc/limpet ~/limpet
+python3 ~/limpet/limpet.py key set        # 鍵を聞かれる。平文ではどこにも書かれない
 ```
+
+下の `suggest` と `calibrate` もこの clone から実行する。
 
 ### 動作要件
 
@@ -135,7 +138,6 @@ git clone https://github.com/noplan-inc/limpet ~/limpet
 - 人にしかできないこと以外を人に振らない
 - 見つけた問題は直してから止まる。「CI が落ちています」で止まらない
 - 待つときは見込み時間を書く
-- Don't say "done" without running the tests
 ```
 
 [既定のルール](rules.md)は、作者のエージェントが実際に破る 10 本。
@@ -145,6 +147,7 @@ git clone https://github.com/noplan-inc/limpet ~/limpet
 どのルールが要るかは、推測しなくていい。limpet は自分の transcript を読んで教えてくれる:
 
 ```sh
+git clone https://github.com/noplan-inc/limpet ~/limpet   # コマンドライン機能は clone から実行する
 python3 ~/limpet/limpet.py suggest            # 直近 30 日。--days 90 --max 5000 で広げる
 ```
 
@@ -184,12 +187,12 @@ python3 ~/limpet/limpet.py calibrate          # --fp 0.10 で誤検知 5% の代
  AUROC   thr  catches  blocks  rule
   0.62  0.42     18%      5%  見つけた問題は直してから止まる …
   0.60  0.49     10%      5%  既に依頼された作業に「始めますか？」と許可を取らない …
-  0.52  0.44      5%      6%  テストを走らせずに「完了」と言わない   (does not separate; left in shadow)
+  0.50  0.41      8%      6%  テストを走らせずに「完了」と言わない   (does not separate; left in shadow)
 
 LIMPET_BLOCK="見つけた問題=0.42,既に依頼され=0.49,…"
 ```
 
-AUROC は「あなたが押し戻した停止」と「問題なかった停止」をそのルールがどれだけ分けられるか（0.5 はコイン投げ）。`blocks` はその閾で実際に止まる「問題なかった停止」の割合で、同じ値が並ぶと目標を超えることがある。0.55 未満のルールは `LIMPET_BLOCK` から外れるが、`rules.md` には残ってログは取り続ける。最後の行を設定にコピーする。
+AUROC は「あなたが押し戻した停止」と「問題なかった停止」をそのルールがどれだけ分けられるか（0.5 はコイン投げ）。`blocks` はその閾で実際に止まる「問題なかった停止」の割合で、同じ値が並ぶと目標を超えることがある。0.55 未満のルールは `LIMPET_BLOCK` から外れるが、`rules.md` には残ってログは取り続ける。最後の行を `settings.json` の `env` か `~/.limpet/env` にコピーする。Claude Code プラグインなら `/plugin` の `block` 設定に値を貼る。この例は上の `suggest` の例とは別の実行なので件数が違う。
 
 `LIMPET_BLOCK` を未設定にすると**影の運転**になる。全停止が採点されて `~/.limpet/log.jsonl` に記録されるだけで、何も止めない。
 
@@ -197,15 +200,15 @@ AUROC は「あなたが押し戻した停止」と「問題なかった停止�
 
 ## どれくらい効くか
 
-正直な数字。作者自身の Claude Code と Codex の 40 日分の transcript（自動化のノイズを除いた、人が返した停止 2,645 件）で測った。「悪い停止」は jev が人の返しを催促か訂正と分類したもので、失敗の型も jev の分類。ラベルにノイズがあるので、この数字は下限。
+正直な数字（ルール名は同梱 `rules.md` の文言）。作者自身の Claude Code と Codex の 40 日分の transcript（自動化のノイズを除いた、人が返した停止 2,645 件）で測った。「悪い停止」は jev が人の返しを催促か訂正と分類したもので、失敗の型も jev の分類。ラベルにノイズがあるので、この数字は下限。
 
 | 失敗の型（件数） | ルール | AUROC | 誤検知 5% で捕まる |
 |---|---|---|---|
 | 丸投げ (646) | 人に振らない | 0.62 | 8% |
 | 丸投げ | 「始めますか？」と聞かない | 0.60 | 5% |
-| 丸投げ | 別の手段を試す／直してから止まる／見込み時間を書く | 0.57〜0.58 | 6〜8% |
+| 丸投げ | 見つけた問題は直してから止まる／待つときは見込み時間を書く | 0.57〜0.58 | 6〜8% |
 | やりすぎ (178) | 頼まれていない提案で止まらない | 0.60 | 12% |
-| やりすぎ | 範囲を広げない | 0.59 | 9% |
+| やりすぎ | タスクの範囲外のファイルを編集しない | 0.59 | 9% |
 | 読み違い (30) | 提案と実行を取り違えない | 0.64 | 10% |
 | 好み (100) | 人の言語で答える | 0.51 | 効かない |
 
@@ -224,13 +227,12 @@ limpet はその間にいる。ルールは任意の言語の自然言語で、�
 
 ## 設定
 
-鍵の取得順は、環境変数（または Claude Code プラグインの設定、`~/.limpet/env` の `KEY=VALUE` 行）→ `key set` で入れた OS のキーチェーン → `LIMPET_KEY_CMD`。プラグイン設定かキーチェーンを使うこと。`~/.limpet/env` は平文で、キーチェーンの無い環境のためだけにある。
+鍵の取得順は、環境変数（または Claude Code プラグインの設定、`~/.limpet/env` の `KEY=VALUE` 行）→ `key set` で入れた OS のキーチェーン → `LIMPET_KEY_CMD`。プラグイン設定かキーチェーンを使うこと。`~/.limpet/env` は平文で、キーチェーンの無い環境のためだけにある。`python3 limpet.py key set` で鍵を保存（Gateway の鍵は `--provider vercel`）、`key rm` で削除。`LIMPET_DEBUG=1` を付けると hook が握りつぶす例外のトレースバックが出る。
 
 | 変数 | 既定 | |
 |---|---|---|
 | `TYPESAFE_API_KEY` | | TypeSafe の鍵。`api.typesafe.ai` を直接呼ぶ |
 | `AI_GATEWAY_API_KEY` | | Vercel AI Gateway の鍵。どちらか一方でよい。両方あれば TypeSafe が優先 |
-| `key set` / `key rm` | | OS のキーチェーンに鍵を保存・削除する（Gateway の鍵は `--provider vercel`） |
 | `LIMPET_KEY_CMD` | | 鍵を出力するシェルコマンド。パスワードマネージャ用。`op read op://vault/item/password` |
 | `LIMPET_PROVIDER` | `vercel` | `typesafe` か `vercel`。`LIMPET_KEY_CMD` を使うときだけ必要 |
 | `LIMPET_BLOCK` | 未設定 | 閾。上記参照。未設定は影の運転 |

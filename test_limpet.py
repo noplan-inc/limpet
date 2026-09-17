@@ -92,6 +92,7 @@ def test_config():
     assert limpet.threshold("anything") == 0.8
     os.environ["LIMPET_BLOCK"] = "hand work=high,broken,shall I start=0.6"  # typos are ignored, never fatal
     assert limpet.threshold("Don't hand work") == float("inf") and limpet.threshold("shall I start?") == 0.6
+    assert limpet.thresholds() == (float("inf"), {"shall I start": 0.6})
     os.environ["LIMPET_BLOCK"] = ""
     os.environ["CLAUDE_PLUGIN_OPTION_BLOCK"] = "0.7"  # Claude Code plugin user config
     assert limpet.threshold("anything") == 0.7
@@ -130,15 +131,16 @@ def test_config():
     os.environ["TYPESAFE_API_KEY"] = "ts"
     assert limpet.api_key() == ("typesafe", "ts")
     del os.environ["TYPESAFE_API_KEY"]
-    assert limpet._keychain_cmd("add", "typesafe")[-1] == "-w" if sys.platform == "darwin" else True  # prompts, key never in argv
+    if sys.platform == "darwin":
+        assert limpet._keychain_cmd("add", "typesafe")[-1] == "-w"  # security prompts; the key never enters argv
     limpet.subprocess.run = real_run
     del os.environ["LIMPET_KEY_CMD"], os.environ["LIMPET_PROVIDER"]
 
-    rs = ["Run the tests, then, only then, say done", "Run the tests, then, only then, report it", "Answer in Japanese"]
-    for r in rs:
-        k = limpet.block_key(r, rs)
-        assert "," not in k and "=" not in k and k and k in r, (r, k)
+    rs = ["Run the tests, then, only then, say done", "Run the tests, then, only then, report it", "Answer in Japanese",
+          "hand the work back", "hand the work back to the human"]
     assert limpet.block_key(rs[2], rs) == "Answer"
+    assert limpet.block_key(rs[4], rs) == "hand the work back " and limpet.block_key(rs[3], rs) is None  # a prefix of another rule
+    assert limpet.block_key("do X, then Y", ["do X, then Y", "do X, then Z"]) is None  # ',' too early: no parsable key
     assert limpet.auroc([0.9, 0.8], [0.1, 0.2]) == 1.0 and limpet.auroc([0.5], [0.5]) == 0.5
     return rules
 
@@ -178,6 +180,16 @@ def test_block_path(path, rules):
     for stdin in ("", "not json", json.dumps({"transcript_path": "/nonexistent"})):
         r = subprocess.run([sys.executable, HOOK], input=stdin, capture_output=True, text=True, env=env, cwd=TMP)
         assert r.returncode == 0 and "Traceback" not in r.stderr, (stdin, r.stderr)
+    r = subprocess.run([sys.executable, HOOK, "--verbose"], input="{}", capture_output=True, text=True, env=env, cwd=TMP)
+    assert r.returncode == 0 and "usage" not in r.stderr, r.stderr  # a stray argument must not become an exit-2 push-back
+    # a log path that cannot be created never silences the block
+    os.environ["LIMPET_LOG"] = "/nonexistent-root/x/log.jsonl"
+    limpet.call = lambda state, qs, key, provider: {"answers": {q: {"probability": 0.9} for q in qs}}
+    os.environ["LIMPET_BLOCK"] = "0.8"
+    sys.stdin, sys.stderr = io.StringIO(json.dumps({"transcript_path": path})), io.StringIO()
+    assert limpet.main() == 2
+    sys.stderr = sys.__stderr__
+    os.environ["LIMPET_LOG"] = os.path.join(TMP, "log.jsonl")
 
 
 def test_suggest_and_calibrate():
