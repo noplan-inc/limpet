@@ -14,6 +14,15 @@ Coding agents stop early. "I'll wait for CI." "Shall I run it?" "Please ask X ab
 
 In practice it also misfires sometimes. That costs the agent one line ("this rule doesn't apply because…") and then it stops normally, so false positives are cheap. Missing a real early stop costs you a round trip, so tune for recall.
 
+## Compared to
+
+Other Stop hooks that push the agent back to work fall into two camps.
+
+- **Regex hooks** such as [checkpoint-guard](https://github.com/platcrest/checkpoint-guard), [llm-dark-patterns](https://github.com/waitdeadai/llm-dark-patterns) and [cc-enforcer](https://github.com/skymanbp/cc-enforcer). Free and instant, but they match English phrasings, so every new way of stopping early needs a new pattern, and rules in other languages are out.
+- **Claude-as-judge hooks** such as Claude Code's built-in `type: "prompt"` hooks or [superpowers](https://github.com/obra/superpowers)' judge script. Understand the rule, but every stop costs a full model call in latency and money.
+
+limpet sits in between: rules are plain language in any language, judged by a classifier built for yes/no questions. About 0.7 seconds and a hundredth of a cent per stop. Because it returns probabilities rather than verdicts, you set the threshold per rule from your own log instead of trusting a fixed prompt.
+
 ## Install
 
 1. Get a Vercel AI Gateway key. jev costs $0.042 per million input tokens; a stop is 1,000 to 2,000 tokens, so a few cents per day of heavy use.

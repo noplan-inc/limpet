@@ -14,6 +14,15 @@ Python 1 ファイル、標準ライブラリのみ。正規表現の保守な�
 
 実際には誤検知もある。その場合エージェントは「このルールは該当しない、理由は…」と 1 行書いて普通に止まるだけなので、誤検知は安い。本当の早すぎる停止を見逃すと人の往復が 1 回増えるので、再現率寄りに調整する。
 
+## 他との違い
+
+エージェントを作業に押し戻す Stop hook は、大きく 2 派ある。
+
+- **正規表現派**: [checkpoint-guard](https://github.com/platcrest/checkpoint-guard)、[llm-dark-patterns](https://github.com/waitdeadai/llm-dark-patterns)、[cc-enforcer](https://github.com/skymanbp/cc-enforcer) など。無料で即時だが、英語の言い回しに一致させる方式なので、新しい止まり方が出るたびにパターンが増え、他の言語のルールは書けない。
+- **Claude に判定させる派**: Claude Code 標準の `type: "prompt"` hook や [superpowers](https://github.com/obra/superpowers) の judge スクリプトなど。ルールの意味は分かるが、停止のたびにモデル 1 回分の遅延と費用がかかる。
+
+limpet はその間にいる。ルールは任意の言語の自然言語で、判定は yes/no 質問専用の分類器がやる。1 停止あたり約 0.7 秒、0.01 セント。判決ではなく確率が返るので、閾は固定のプロンプトを信じるのではなく、自分のログからルールごとに決められる。
+
 ## インストール
 
 1. Vercel AI Gateway の鍵を用意する。jev は入力 100 万トークンあたり $0.042。1 停止あたり 1,000〜2,000 トークンなので、ヘビーに使っても 1 日数セント。
