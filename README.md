@@ -1,5 +1,7 @@
 # limpet
 
+English | [日本語](README.ja.md)
+
 A Claude Code Stop hook that stops the agent from stopping too early.
 
 You write rules in plain language in `rules.md`. Every time Claude Code is about to stop, limpet sends the last few turns to [jev](https://typesafe.ai) (TypeSafe AI's evaluation model, via [Vercel AI Gateway](https://vercel.com/ai-gateway)) and gets, for each rule, the probability that it was just violated. If a rule is over its threshold, the agent is told to keep working instead of stopping.
