@@ -1,0 +1,41 @@
+{
+  "name": "limpet",
+  "displayName": "limpet",
+  "version": "0.1.0",
+  "description": "Stops your agent from stopping too early. Plain-language rules, judged by jev in 0.7 s.",
+  "author": {
+    "name": "no plan inc.",
+    "url": "https://github.com/noplan-inc"
+  },
+  "homepage": "https://github.com/noplan-inc/limpet",
+  "repository": "https://github.com/noplan-inc/limpet",
+  "license": "MIT",
+  "keywords": [
+    "hooks",
+    "stop-hook",
+    "jev",
+    "agent",
+    "rules"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "userConfig": {
+    "typesafe_api_key": {
+      "type": "string",
+      "title": "TypeSafe API key",
+      "description": "Calls jev directly. Get one at https://console.typesafe.ai/keys. Leave empty if you use Vercel AI Gateway instead.",
+      "sensitive": true
+    },
+    "ai_gateway_api_key": {
+      "type": "string",
+      "title": "Vercel AI Gateway key",
+      "description": "Calls jev through Vercel AI Gateway (https://vercel.com/ai-gateway). Leave empty if you use a TypeSafe key.",
+      "sensitive": true
+    },
+    "block": {
+      "type": "string",
+      "title": "Block thresholds",
+      "description": "Leave empty for shadow mode (log only). \"0.8\" for every rule, or \"substring of rule=0.5,other rule=0.6\".",
+      "default": ""
+    }
+  }
+}

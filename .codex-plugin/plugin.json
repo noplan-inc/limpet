@@ -1,0 +1,22 @@
+{
+  "name": "limpet",
+  "version": "0.1.0",
+  "description": "Stops your agent from stopping too early. Plain-language rules, judged by jev in 0.7 s.",
+  "author": { "name": "no plan inc.", "url": "https://github.com/noplan-inc" },
+  "homepage": "https://github.com/noplan-inc/limpet",
+  "repository": "https://github.com/noplan-inc/limpet",
+  "license": "MIT",
+  "keywords": ["hooks", "stop-hook", "jev", "agent", "rules"],
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "limpet",
+    "shortDescription": "Stops your agent from stopping too early",
+    "longDescription": "A Stop hook. You write rules in plain language; jev scores each stop against them in 0.7 s and pushes the agent back to work when a rule is violated.",
+    "developerName": "no plan inc.",
+    "category": "Productivity",
+    "capabilities": ["Lifecycle hooks"],
+    "websiteURL": "https://github.com/noplan-inc/limpet",
+    "brandColor": "#0b6e6e",
+    "logo": "./assets/logo.svg"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "description": "limpet: ask jev whether the agent is stopping too early; push it back to work if so.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/limpet.py\"",
+            "timeout": 30,
+            "statusMessage": "limpet is checking the rules"
+          }
+        ]
+      }
+    ]
+  }
+}

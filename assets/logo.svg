@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240" role="img" aria-label="limpet">
+  <defs>
+    <linearGradient id="shell" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1fa3a3"/>
+      <stop offset="1" stop-color="#0b6e6e"/>
+    </linearGradient>
+  </defs>
+  <!-- rock -->
+  <path d="M8 200 Q60 170 120 186 Q180 202 232 190 L232 232 L8 232 Z" fill="#3a3f47"/>
+  <!-- shell: a low cone with ridges -->
+  <path d="M28 186 L120 52 L212 186 Q120 206 28 186 Z" fill="url(#shell)"/>
+  <g stroke="#e9fbfb" stroke-width="3" stroke-linecap="round" fill="none" opacity=".85">
+    <path d="M120 52 L72 184"/><path d="M120 52 L96 190"/><path d="M120 52 L120 192"/>
+    <path d="M120 52 L144 190"/><path d="M120 52 L168 184"/>
+  </g>
+  <path d="M36 184 Q120 200 204 184" stroke="#e9fbfb" stroke-width="3" fill="none" opacity=".6"/>
+  <!-- apex highlight -->
+  <circle cx="120" cy="56" r="5" fill="#e9fbfb"/>
+</svg>

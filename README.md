@@ -1,102 +1,205 @@
-# limpet
+<p align="center">
+  <img src="assets/logo.svg" width="160" alt="limpet">
+</p>
 
-English | [日本語](README.ja.md)
+<h1 align="center">limpet</h1>
 
-A Claude Code Stop hook that stops the agent from stopping too early.
+<p align="center">
+  <em>Your agent stops. limpet doesn't let it.</em>
+</p>
 
-You write rules in plain language in `rules.md`. Every time Claude Code is about to stop, limpet sends the last few turns to [jev](https://typesafe.ai) (TypeSafe AI's evaluation model, via [Vercel AI Gateway](https://vercel.com/ai-gateway)) and gets, for each rule, the probability that it was just violated. If a rule is over its threshold, the agent is told to keep working instead of stopping.
+<p align="center">
+  <a href="https://github.com/noplan-inc/limpet/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/noplan-inc/limpet/test.yml?style=flat-square&label=tests&color=0b6e6e" alt="tests"></a>
+  <img src="https://img.shields.io/badge/works%20with-Claude%20Code%20%C2%B7%20Codex-0b6e6e?style=flat-square" alt="Claude Code and Codex">
+  <img src="https://img.shields.io/badge/deps-stdlib%20only-0b6e6e?style=flat-square" alt="stdlib only">
+  <img src="https://img.shields.io/badge/per%20stop-0.7s%20%C2%B7%20%240.0001-0b6e6e?style=flat-square" alt="0.7 s and a hundredth of a cent per stop">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0b6e6e?style=flat-square" alt="MIT"></a>
+</p>
 
-One Python file, standard library only. No regexes to maintain, no local model, no training.
+<p align="center">
+  <sub>English &middot; <a href="README.ja.md">日本語</a></sub>
+</p>
 
-## Why
+---
 
-Coding agents stop early. "I'll wait for CI." "Shall I run it?" "Please ask X about this." You type "do it". Then again. Limpet catches those stops before you see them and pushes the agent back to work, so it clings to the task like a limpet to a rock.
+Coding agents stop early. *"I'll wait for CI."* *"Shall I run it?"* *"Please ask the team about this."* You type **do it**. Then again. Then again.
 
-In practice it also misfires sometimes. That costs the agent one line ("this rule doesn't apply because…") and then it stops normally, so false positives are cheap. Missing a real early stop costs you a round trip, so tune for recall.
+limpet is a Stop hook. You write rules in plain language. Every time the agent is about to stop, [jev](https://typesafe.ai) scores the stop against every rule in **0.7 seconds**, and if a rule is violated the agent is sent back to work instead of stopping. It clings to the task like a limpet to a rock.
 
-## Compared to
+One Python file. Standard library only. No regexes to maintain, no local model, no training.
 
-Other Stop hooks that push the agent back to work fall into two camps.
+## Before / after
 
-- **Regex hooks** such as [checkpoint-guard](https://github.com/platcrest/checkpoint-guard), [llm-dark-patterns](https://github.com/waitdeadai/llm-dark-patterns) and [cc-enforcer](https://github.com/skymanbp/cc-enforcer). Free and instant, but they match English phrasings, so every new way of stopping early needs a new pattern, and rules in other languages are out.
-- **Claude-as-judge hooks** such as Claude Code's built-in `type: "prompt"` hooks or [superpowers](https://github.com/obra/superpowers)' judge script. Understand the rule, but every stop costs a full model call in latency and money.
+Without limpet:
 
-limpet sits in between: rules are plain language in any language, judged by a classifier built for yes/no questions. About 0.7 seconds and a hundredth of a cent per stop. Because it returns probabilities rather than verdicts, you set the threshold per rule from your own log instead of trusting a fixed prompt.
+```
+● I've found the bug in auth.py. The fix is a one-line change to the
+  token check. Want me to apply it?
+
+> do it
+```
+
+With limpet, the same stop never reaches you:
+
+```
+● I've found the bug in auth.py. The fix is a one-line change to the
+  token check. Want me to apply it?
+
+  ⏹ limpet: this response may violate: "Don't ask 'shall I start?' for
+    work that was already requested" (91%). If it does, follow the rule
+    and keep working. If it does not, say why in one line, then stop.
+
+● Applying the fix.
+  ⎿ Edit auth.py
+  ⎿ Bash pytest -q · 42 passed
+  Done. The token check now rejects expired tokens; tests pass.
+```
+
+## How it works
+
+```
+agent is about to stop
+        │
+        ▼
+limpet reads the last 3 messages + this turn's tool calls + the final message
+        │
+        ▼
+jev answers one yes/no question per rule, all in parallel, in ~0.7 s
+   "Don't say done without running tests"        →  0.08
+   "Don't ask 'shall I start?' for requested work" →  0.91  ◀ over threshold
+   "Fix problems you find before stopping"        →  0.31
+        │
+        ▼
+exit 2 + one line on stderr → the agent keeps working
+```
+
+The second stop of the same chain is always allowed through, so the agent is pushed back at most once per stop. If it disagrees, it says why in one line and stops. False positives cost one sentence. Missed early stops cost you a round trip. Tune for recall.
 
 ## Install
 
-1. Get a Vercel AI Gateway key. jev costs $0.042 per million input tokens; a stop is 1,000 to 2,000 tokens, so a few cents per day of heavy use.
-2. Clone this repo:
+You need a key for jev. Either one works:
 
-   ```sh
-   git clone https://github.com/noplan-inc/limpet ~/limpet
-   ```
+- **TypeSafe** (direct): https://console.typesafe.ai/keys
+- **Vercel AI Gateway**: https://vercel.com/ai-gateway, model `typesafe-ai/jev`
 
-3. Add the hook to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
+A stop is 1,000 to 2,000 input tokens. At jev's price that is about a hundredth of a cent, so a heavy day is a few cents.
 
-   ```json
-   {
-     "env": {
-       "AI_GATEWAY_API_KEY": "vck_...",
-       "LIMPET_BLOCK": "0.8"
-     },
-     "hooks": {
-       "Stop": [{ "hooks": [{ "type": "command", "command": "python3 ~/limpet/jev_stop.py", "timeout": 30 }] }]
-     }
-   }
-   ```
+### Claude Code
 
-   If you would rather not put the key in a file, set `LIMPET_KEY_CMD` to a shell command that prints it, for example `op read op://vault/vercel-ai-gateway/password`.
+```
+/plugin marketplace add noplan-inc/limpet
+```
+```
+/plugin install limpet@limpet
+```
 
-4. Edit `rules.md`. Only lines starting with `- ` are rules. Any language works.
+Claude Code asks for your key and thresholds on install (they go to secure storage, not to `settings.json`). Or from the shell:
+
+```sh
+claude plugin marketplace add noplan-inc/limpet
+claude plugin install limpet@limpet --config typesafe_api_key=... --config block=0.8
+```
+
+### Codex
+
+```sh
+codex plugin marketplace add noplan-inc/limpet
+codex plugin add limpet@limpet
+```
+
+Then run `codex`, open `/hooks`, and trust limpet's Stop hook. Codex plugins don't carry secrets, so put the key in `~/.limpet/env`:
+
+```sh
+mkdir -p ~/.limpet && echo 'TYPESAFE_API_KEY=...' >> ~/.limpet/env
+```
+
+### Any agent with Claude-style hooks
+
+```sh
+git clone https://github.com/noplan-inc/limpet ~/limpet
+```
+
+Add a `Stop` hook running `python3 ~/limpet/limpet.py` (timeout 30) to `~/.claude/settings.json`, `~/.codex/hooks.json`, or wherever your agent keeps hooks, and put the key in `~/.limpet/env`.
+
+## Rules
+
+On first run limpet copies its default rules to `~/.limpet/rules.md`. Edit that file. Only lines starting with `- ` are rules. Any language works.
+
+```markdown
+- Don't say "done" without running the tests
+- Don't ask "shall I start?" for work that was already requested. Only ask before irreversible actions
+- Don't hand work to the human unless only a human can do it
+- Fix problems you find before stopping. Don't stop at "CI is failing"
+- When waiting, give a time estimate
+- テストを走らせずに「完了」と言わない
+```
+
+The [default rules](rules.md) are the nine that the author's agents actually break.
 
 ## Thresholds
 
-`LIMPET_BLOCK` is either one number for every rule, or a comma list of `substring of the rule=threshold`:
-
-```
-LIMPET_BLOCK="shall I start=0.30,hand work=0.60,before stopping=0.35,time estimate=0.74"
-```
-
-Rules without a threshold never block. Leave `LIMPET_BLOCK` unset to run in shadow mode: every stop is scored and logged to `~/.limpet/log.jsonl`, nothing is blocked. After a day or two:
+Start in **shadow mode**: no thresholds set. Every stop is scored and logged to `~/.limpet/log.jsonl`, nothing is blocked. After a day or two:
 
 ```sh
-python3 ~/limpet/jev_stop.py --stats
+python3 ~/limpet/limpet.py --stats
 ```
 
-prints per-rule percentiles. A threshold around p95 blocks the worst 5% of stops for that rule, which is where the author started.
+```
+312 stops in /Users/you/.limpet/log.jsonl
+p50=0.06 p90=0.21 p95=0.30 max=0.97 blocked=  0  Don't ask "shall I start?" …
+p50=0.12 p90=0.44 p95=0.60 max=0.99 blocked=  0  Don't hand work to the human …
+p50=0.09 p90=0.25 p95=0.35 max=0.93 blocked=  0  Fix problems you find before stopping …
+```
 
-## What the agent sees
+Pick a threshold around p95 for the rules that matter and set it, per rule or for all:
 
-On a hit, the hook exits 2 with this on stderr, which Claude Code feeds back to the agent:
+```
+LIMPET_BLOCK="shall I start=0.30,hand work=0.60,before stopping=0.35"
+LIMPET_BLOCK="0.8"
+```
 
-> limpet: this response may violate: "Fix problems you find before stopping…" (83%). If it does, follow the rule and keep working. If it does not, say why in one line, then stop.
+Rules without a threshold never block. The key is any substring of the rule text.
 
-The second stop of the same chain has `stop_hook_active` set and is always allowed through, so the agent is pushed back at most once per stop.
+## Compared to
 
-## Failure mode
+Other Stop hooks that push the agent back fall into two camps.
 
-No key, API error, or timeout: exit 0, silently. The hook must never block work because a service is down. Errors are recorded in the log.
+- **Regex hooks** such as [checkpoint-guard](https://github.com/platcrest/checkpoint-guard), [llm-dark-patterns](https://github.com/waitdeadai/llm-dark-patterns) and [cc-enforcer](https://github.com/skymanbp/cc-enforcer). Free and instant, but they match English phrasings. Every new way of stopping early needs a new pattern, and rules in other languages are out.
+- **Claude-as-judge hooks** such as Claude Code's built-in `type: "prompt"` hooks or [superpowers](https://github.com/obra/superpowers)' judge script. They understand the rule, but every stop costs a full model call in latency and money.
 
-## Environment
+limpet sits in between. Rules are plain language in any language, judged by a model built for yes/no questions. Because it returns probabilities rather than verdicts, you set the threshold per rule from your own log instead of trusting a fixed prompt.
+
+## Configuration
+
+Environment variables, or `KEY=VALUE` lines in `~/.limpet/env`. Claude Code plugin settings map to the same names.
 
 | Variable | Default | |
 |---|---|---|
-| `AI_GATEWAY_API_KEY` | | Vercel AI Gateway key |
-| `LIMPET_KEY_CMD` | | Shell command that prints the key, used when the variable above is unset |
-| `LIMPET_BLOCK` | unset | Thresholds, see above |
-| `LIMPET_RULES` | `rules.md` next to the script | Rules file |
-| `LIMPET_LOG` | `~/.limpet/log.jsonl` | Log file, one JSON line per stop |
-| `LIMPET_JEV_MODEL` | `typesafe-ai/jev` | Model id sent to the gateway |
+| `TYPESAFE_API_KEY` | | TypeSafe key. Calls `api.typesafe.ai` directly |
+| `AI_GATEWAY_API_KEY` | | Vercel AI Gateway key. Either key is enough; TypeSafe wins if both are set |
+| `LIMPET_KEY_CMD` | | Shell command that prints the key, for password managers. `op read op://vault/item/password` |
+| `LIMPET_PROVIDER` | `vercel` | `typesafe` or `vercel`. Only needed with `LIMPET_KEY_CMD` |
+| `LIMPET_BLOCK` | unset | Thresholds, see above. Unset is shadow mode |
+| `LIMPET_RULES` | `~/.limpet/rules.md` | Rules file |
+| `LIMPET_LOG` | `~/.limpet/log.jsonl` | One JSON line per stop: probabilities, latency, tokens, what was blocked |
+| `LIMPET_JEV_MODEL` | `jev-latest` / `typesafe-ai/jev` | Model id sent to the provider |
+
+## Failure mode
+
+No key, API error, or timeout: exit 0, silently. A hook must never block work because a service is down. Errors are recorded in the log.
+
+## Privacy
+
+Each stop sends the last three messages, one line per tool call of the current turn (tool name and its main argument), and the final message to the provider you chose. Nothing else leaves the machine. The log stays in `~/.limpet`.
 
 ## Test
 
 ```sh
-python3 test_jev_stop.py
+python3 test_limpet.py
 ```
 
-Does not call the API.
+Runs in under a second and calls no API. CI runs it on Linux and macOS, Python 3.9 and 3.13.
 
 ## License
 
-MIT
+MIT. Made by [no plan inc.](https://github.com/noplan-inc)
