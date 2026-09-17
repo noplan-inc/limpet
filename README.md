@@ -82,7 +82,7 @@ You need a key for jev. Either one works:
 - **TypeSafe** (direct): https://console.typesafe.ai/keys
 - **Vercel AI Gateway**: https://vercel.com/ai-gateway, model `typesafe-ai/jev`
 
-A stop is 1,000 to 2,000 input tokens. At jev's price that is about a hundredth of a cent, so a heavy day is a few cents.
+A stop is one call with one yes/no question per rule, 1,000 to 2,000 input tokens. At jev's price that is about a hundredth of a cent, so a heavy day is a few cents.
 
 ### Claude Code
 
@@ -113,6 +113,10 @@ Then run `codex`, open `/hooks`, and trust limpet's Stop hook. Codex plugins don
 mkdir -p ~/.limpet && echo 'TYPESAFE_API_KEY=...' >> ~/.limpet/env
 ```
 
+### Requirements
+
+Python 3.9 or newer on `PATH` as `python3`. Tested on macOS and Linux.
+
 ### Any agent with Claude-style hooks
 
 ```sh
@@ -134,7 +138,7 @@ On first run limpet copies its default rules to `~/.limpet/rules.md`. Edit that 
 - テストを走らせずに「完了」と言わない
 ```
 
-The [default rules](rules.md) are the nine that the author's agents actually break.
+The [default rules](rules.md) are the ten that the author's agents actually break.
 
 ## Find your rules
 
@@ -177,37 +181,19 @@ python3 ~/limpet/limpet.py calibrate          # --fp 0.10 to accept 10% false po
 ```
 1500 scored in 198 s: 597 stops the human pushed back on, 903 fine.
 
- AUROC   thr  catches  rule
-  0.62  0.42     18%  Fix problems you find before stopping …
-  0.60  0.49     10%  Don't ask "shall I start?" …
-  0.50  0.41      8%  Don't say "done" without running the tests   (does not separate; left in shadow)
+ AUROC   thr  catches  blocks  rule
+  0.62  0.42     18%      5%  Fix problems you find before stopping …
+  0.60  0.49     10%      5%  Don't ask "shall I start?" …
+  0.50  0.41      8%      6%  Don't say "done" without running the tests   (does not separate; left in shadow)
 
 LIMPET_BLOCK="Fix problems=0.42,Don't ask=0.49,…"
 ```
 
-AUROC is how well the rule separates stops you pushed back on from stops you were fine with (0.5 is a coin toss). A rule below 0.55 is left out of `LIMPET_BLOCK`; it stays in `rules.md` and keeps being logged. Copy the last line into your settings.
+AUROC is how well the rule separates stops you pushed back on from stops you were fine with (0.5 is a coin toss). `blocks` is the share of fine stops the threshold actually blocks, which can exceed the target when many stops tie. A rule below 0.55 is left out of `LIMPET_BLOCK`; it stays in `rules.md` and keeps being logged. Copy the last line into your settings.
 
-Or start in **shadow mode**: no thresholds set. Every stop is scored and logged to `~/.limpet/log.jsonl`, nothing is blocked. After a day or two:
+Without `LIMPET_BLOCK` set, limpet runs in **shadow mode**: every stop is scored and logged to `~/.limpet/log.jsonl`, nothing is blocked.
 
-```sh
-python3 ~/limpet/limpet.py --stats
-```
-
-```
-312 stops in /Users/you/.limpet/log.jsonl
-p50=0.06 p90=0.21 p95=0.30 max=0.97 blocked=  0  Don't ask "shall I start?" …
-p50=0.12 p90=0.44 p95=0.60 max=0.99 blocked=  0  Don't hand work to the human …
-p50=0.09 p90=0.25 p95=0.35 max=0.93 blocked=  0  Fix problems you find before stopping …
-```
-
-Pick a threshold around p95 for the rules that matter and set it, per rule or for all:
-
-```
-LIMPET_BLOCK="shall I start=0.30,hand work=0.60,before stopping=0.35"
-LIMPET_BLOCK="0.8"
-```
-
-Rules without a threshold never block. The key is any substring of the rule text.
+`LIMPET_BLOCK` is one number for every rule, or a comma list of `substring of the rule=threshold`. Rules without a threshold never block.
 
 ## Compared to
 
@@ -239,7 +225,9 @@ No key, API error, or timeout: exit 0, silently. A hook must never block work be
 
 ## Privacy
 
-Each stop sends the last three messages, one line per tool call of the current turn (tool name and its main argument), and the final message to the provider you chose. `suggest` additionally sends your own replies, and edits of the turn are not sent. Nothing else leaves the machine. The log and the suggestions stay in `~/.limpet`.
+Each stop sends the last three messages, one line per tool call of the current turn (tool name and its main argument, the last 40 calls), and the final message to the provider you chose. File contents and diffs are never sent.
+
+`suggest` and `calibrate` read transcripts of **every** Claude Code project and Codex session on the machine (last 30 days by default) and send the same fields plus your own replies. Nothing else leaves the machine. The log and the suggestions stay in `~/.limpet`.
 
 ## Test
 

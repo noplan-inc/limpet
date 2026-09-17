@@ -1,8 +1,10 @@
 {
-  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "limpet",
   "description": "limpet: stops your coding agent from stopping too early.",
-  "owner": { "name": "no plan inc.", "url": "https://github.com/noplan-inc" },
+  "owner": {
+    "name": "no plan inc.",
+    "url": "https://github.com/noplan-inc"
+  },
   "plugins": [
     {
       "name": "limpet",

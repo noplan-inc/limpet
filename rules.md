@@ -11,3 +11,4 @@ One rule per line, in plain language. Only lines starting with `- ` are rules; e
 - Fix problems you find before stopping. Don't stop at "CI is failing" or "there's a bug". If you can't fix it, say why
 - When waiting, give a time estimate. Don't stop with "I'll wait for it to finish" or "I'll let you know when it's up"
 - Don't stop to offer things that weren't asked for ("want me to automate this too?", "should I build that first?"). Proposals go in the last line of the report, at most
+- Answer in the language the human writes in

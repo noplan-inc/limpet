@@ -2,16 +2,16 @@
 """limpet: a Stop hook that stops your coding agent from stopping too early.
 
 Works as a Stop hook in Claude Code and Codex CLI. When the agent is about to stop, limpet sends the last
-few turns, this turn's tool calls, and the final message to jev (TypeSafe AI's evaluation model, via Vercel
-AI Gateway). jev returns, for every rule in rules.md, the probability that the rule was just violated. If a
-rule is over its threshold, the hook exits 2 with a message telling the agent to keep working.
+few turns, this turn's tool calls, and the final message to jev (TypeSafe AI's evaluation model, directly or
+via Vercel AI Gateway). jev returns, for every rule in rules.md, the probability that the rule was just
+violated. If a rule is over its threshold, the hook exits 2 with a message telling the agent to keep working.
 
     echo '{"transcript_path": "...", "stop_hook_active": false}' | python3 limpet.py
-    python3 limpet.py --stats      # per-rule percentiles from the log, to pick thresholds
     python3 limpet.py suggest      # mine your transcripts for the rules you actually need
     python3 limpet.py calibrate    # score rules.md against your transcripts and print LIMPET_BLOCK
 
-Configuration, in order of precedence: environment, then ~/.limpet/env (KEY=VALUE lines).
+Configuration, in order of precedence: environment, Claude Code plugin config (CLAUDE_PLUGIN_OPTION_*),
+then ~/.limpet/env (KEY=VALUE lines).
     TYPESAFE_API_KEY    TypeSafe key (https://console.typesafe.ai/keys) => calls api.typesafe.ai directly.
     AI_GATEWAY_API_KEY  Vercel AI Gateway key => calls jev through the gateway. Either key is enough.
     LIMPET_KEY_CMD      a shell command that prints the key, if you keep it in a password manager.
@@ -20,12 +20,11 @@ Configuration, in order of precedence: environment, then ~/.limpet/env (KEY=VALU
                         (a substring of the rule text => its threshold). Unset = shadow mode: log, never block.
     LIMPET_RULES        rules file (default: ~/.limpet/rules.md, created from the bundled rules.md on first run)
     LIMPET_LOG          log file (default: ~/.limpet/log.jsonl)
-    LIMPET_JEV_MODEL    default typesafe-ai/jev
-When installed as a Claude Code plugin, the key and thresholds also come from the plugin's user config
-(CLAUDE_PLUGIN_OPTION_TYPESAFE_API_KEY, CLAUDE_PLUGIN_OPTION_AI_GATEWAY_API_KEY, CLAUDE_PLUGIN_OPTION_BLOCK).
+    LIMPET_JEV_MODEL    default jev-latest (TypeSafe) / typesafe-ai/jev (Vercel)
 
-No key, API down, or timeout => exit 0 silently. A hook must never stop the work.
+No key, API down, timeout, or any other error => exit 0 silently. A hook must never stop the work.
 """
+import argparse
 import glob
 import json
 import os
@@ -35,20 +34,19 @@ import subprocess
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~/.limpet")
-PROVIDERS = {  # url, model, question type, answer field
+PROVIDERS = {  # url, model, yes/no question type, answer field
     "typesafe": ("https://api.typesafe.ai/v1/systemone", "jev-latest", "noul", "noul"),
     "vercel": ("https://ai-gateway.vercel.sh/v4/ai/evaluation-model", "typesafe-ai/jev", "boolean", "probability"),
 }
-TIMEOUT = 20
+TIMEOUT = 20  # jev call; the key command gets 8 s, so both fit in the hook's 30 s
 TAIL_BYTES = 512 * 1024  # only the tail of the transcript is read
 N_CONTEXT = 3  # previous messages sent as context
 MAXLEN = 2000  # per message
-MAX_TOOLS = 40
-MAX_TOOL_STR = 200
-SCOLD_Q = "After this message, will the human scold or correct the agent?"
+MAX_TOOLS = 40  # tool calls of the current turn, most recent kept
 
 # user lines that look human but are injected by the harness (collected from real transcripts)
 NOT_HUMAN_PREFIXES = (
@@ -63,20 +61,24 @@ NOT_HUMAN_PREFIXES = (
 
 # --- config ---
 
+def _plugin_option(name):
+    return os.environ.get("CLAUDE_PLUGIN_OPTION_" + (name[7:] if name.startswith("LIMPET_") else name))
+
+
 def load_env(path=os.path.join(HOME, "env")):
-    """KEY=VALUE lines. Environment wins; the file fills in what is missing."""
+    """KEY=VALUE lines. Environment and plugin config win; the file fills in what is missing."""
     try:
         with open(path, encoding="utf-8") as f:
             for l in f:
                 k, eq, v = l.strip().partition("=")
-                if eq and k and not k.startswith("#") and not os.environ.get(k):
+                if eq and k and not k.startswith("#") and not os.environ.get(k) and not _plugin_option(k):
                     os.environ[k] = v.strip().strip("'\"")
     except OSError:
         pass
 
 
 def cfg(name, default=None):
-    return os.environ.get(name) or os.environ.get("CLAUDE_PLUGIN_OPTION_" + name.removeprefix("LIMPET_")) or default
+    return os.environ.get(name) or _plugin_option(name) or default
 
 
 def rules_path():
@@ -104,7 +106,7 @@ def api_key():
     cmd = cfg("LIMPET_KEY_CMD")
     if cmd:
         try:
-            k = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=25).stdout.strip()
+            k = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=8).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             k = None
         if k:
@@ -113,6 +115,7 @@ def api_key():
 
 
 def threshold(rule):
+    """LIMPET_BLOCK => threshold for this rule. Malformed parts are ignored, never fatal."""
     spec = (cfg("LIMPET_BLOCK") or "").strip()
     if not spec:
         return float("inf")
@@ -121,9 +124,12 @@ def threshold(rule):
     except ValueError:
         pass
     for part in spec.split(","):
-        k, _, v = part.partition("=")
-        if k.strip() and k.strip() in rule:
-            return float(v)
+        k, _, v = part.rpartition("=")
+        try:
+            if k.strip() and k.strip() in rule:
+                return float(v)
+        except ValueError:
+            continue
     return float("inf")
 
 
@@ -175,11 +181,11 @@ def tool_line(name, inp):
             inp = json.loads(inp)
         except ValueError:
             inp = {"input": inp}
-    inp = inp or {}
+    inp = inp if isinstance(inp, dict) else {}
     v = inp.get("command") or inp.get("cmd") or inp.get("file_path") or inp.get("path") or inp.get("pattern") \
         or inp.get("url") or next((x for x in inp.values() if isinstance(x, str)), "")
     s = f"{name}: {v}".strip()
-    return s if len(s) <= MAX_TOOL_STR else s[:MAX_TOOL_STR] + "…"
+    return s if len(s) <= 200 else s[:200] + "…"
 
 
 def tools_since_turn(rows):
@@ -210,17 +216,25 @@ def tools_since_turn(rows):
     return [f"{line} → {results[i]}" if i in results else line for i, line in uses][-MAX_TOOLS:]
 
 
-def read_tail(path):
-    """(previous messages newest first, final assistant message, tool calls of this turn)."""
-    with open(path, "rb") as f:
-        f.seek(max(0, os.path.getsize(path) - TAIL_BYTES))
-        lines = f.read().decode("utf-8", "replace").splitlines()[1:]
+def _rows(text):
     rows = []
-    for l in lines:
+    for l in text.splitlines():
         try:
             rows.append(json.loads(l))
         except ValueError:
             continue
+    return rows
+
+
+def read_tail(path):
+    """(previous messages newest first, final assistant message, tool calls of this turn)."""
+    with open(path, "rb") as f:
+        start = max(0, os.path.getsize(path) - TAIL_BYTES)
+        f.seek(start)
+        text = f.read().decode("utf-8", "replace")
+    if start:  # the first line is cut mid-way
+        text = text.split("\n", 1)[-1]
+    rows = _rows(text)
     texts = [s for d in rows for s in [assistant_text(d) or human_text(d)] if s]
     if not texts:
         return [], None, []
@@ -230,23 +244,23 @@ def read_tail(path):
 
 # --- jev ---
 
-def build_request(rules, context, last, tools=None, provider="vercel"):
-    url, model, qtype, _ = PROVIDERS[provider]
-    state = {"previous messages (newest first)": context, "tool calls this turn (oldest first)": tools or [],
-             "agent's final message before stopping": last}
-    qs = {f"r{i}": {"type": qtype, "instructions": f"Is the agent violating this rule? Rule: {r}"}
-          for i, r in enumerate(rules)}
-    qs["scold"] = {"type": qtype, "instructions": SCOLD_Q}
-    body = {"state": state, "questions": qs}
+def _state(context, last, tools):
+    return {"previous messages (newest first)": context, "tool calls this turn (oldest first)": tools or [],
+            "agent's final message before stopping": last}
+
+
+def rule_questions(rules, provider):
+    qtype = PROVIDERS[provider][2]
+    return {f"r{i}": {"type": qtype, "instructions": f"Is the agent violating this rule? Rule: {r}"} for i, r in enumerate(rules)}
+
+
+def call(state, questions, key, provider):
+    url, model, _, _ = PROVIDERS[provider]
+    body = {"state": state, "questions": questions}
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     if provider == "typesafe":
         body["model"] = cfg("LIMPET_JEV_MODEL", model)
-    return body
-
-
-def call(body, key, provider="vercel"):
-    url, model, _, _ = PROVIDERS[provider]
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    if provider == "vercel":
+    else:
         headers.update({"ai-model-id": cfg("LIMPET_JEV_MODEL", model), "ai-evaluation-model-specification-version": "4",
                         "ai-gateway-protocol-version": "0.0.1", "ai-gateway-auth-method": "api-key"})
     req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode(), method="POST", headers=headers)
@@ -255,14 +269,19 @@ def call(body, key, provider="vercel"):
 
 
 def prob(answer, provider):
-    return (answer or {}).get(PROVIDERS[provider][3])
+    p = (answer or {}).get(PROVIDERS[provider][3])
+    return float(p) if isinstance(p, (int, float)) else None
 
 
-# --- entry points ---
+def choice(answer):
+    return answer.get("choice") or max(answer["probabilities"], key=answer["probabilities"].get), answer.get("confidence", 0)
+
+
+# --- the hook ---
 
 def main():
     hook = json.load(sys.stdin)
-    if hook.get("stop_hook_active"):  # we already pushed back once on this stop; don't loop
+    if hook.get("stop_hook_active"):  # Claude Code and Codex both set this after a push-back; don't loop
         return 0
     load_env()
     provider, key = api_key()
@@ -277,19 +296,19 @@ def main():
         return 0
     t0 = time.time()
     try:
-        res = call(build_request(rules, context, last, tools, provider), key, provider)
+        res = call(_state(context, last, tools), rule_questions(rules, provider), key, provider)
+        ans = res.get("answers") or {}
     except Exception as e:  # noqa: BLE001  never block on API trouble
-        res = {"error": str(e)[:300]}
-    ans = res.get("answers", {})
+        res, ans = {"error": str(e)[:300]}, {}
     probs = {r: prob(ans.get(f"r{i}"), provider) for i, r in enumerate(rules)}
-    probs["(scold)"] = prob(ans.get("scold"), provider)
     hits = [(r, p) for r, p in probs.items() if p is not None and p >= threshold(r)]
     log = os.path.expanduser(cfg("LIMPET_LOG", os.path.join(HOME, "log.jsonl")))
     rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "agent": "codex" if "turn_id" in hook else "claude", "provider": provider,
            "session_id": hook.get("session_id"), "cwd": hook.get("cwd"), "transcript_path": hook.get("transcript_path"),
            "ms": int((time.time() - t0) * 1000), "usage": res.get("usage"), "error": res.get("error"), "probs": probs,
            "blocked": [r for r, _ in hits], "n_tools": len(tools), "assistant_text": last[:500]}
-    os.makedirs(os.path.dirname(log), exist_ok=True)
+    if os.path.dirname(log):
+        os.makedirs(os.path.dirname(log), exist_ok=True)
     with open(log, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     if hits:
@@ -300,27 +319,7 @@ def main():
     return 0
 
 
-def stats(path=None):
-    load_env()
-    path = os.path.expanduser(path or cfg("LIMPET_LOG", os.path.join(HOME, "log.jsonl")))
-    rows = []
-    with open(path, encoding="utf-8") as f:
-        for l in f:
-            try:
-                rows.append(json.loads(l))
-            except ValueError:
-                continue
-    print(f"{len(rows)} stops in {path}")
-    for r in sorted({r for d in rows for r in d.get("probs", {})}):
-        ps = sorted(p for d in rows if (p := d["probs"].get(r)) is not None)
-        if not ps:
-            continue
-        q = lambda f: ps[min(len(ps) - 1, int(f * len(ps)))]  # noqa: E731
-        blocked = sum(r in d.get("blocked", []) for d in rows)
-        print(f"p50={q(.5):.2f} p90={q(.9):.2f} p95={q(.95):.2f} max={ps[-1]:.2f} blocked={blocked:3d}  {r}")
-
-
-# --- suggest: mine transcripts for rules ---
+# --- suggest and calibrate: learn from your own transcripts ---
 
 REACTIONS = {
     "push": "the human tells the agent to do what it should already have done: 'do it', 'continue', 'go ahead', 'fix it', 'やって', '進めて'",
@@ -340,17 +339,8 @@ FAILURES = {
     "taste": "quality or preference: too thin, too short, wrong style, wrong wording, wrong language",
     "other": "none of the above",
 }
-# what limpet can act on at stop time, and the rule that targets it
-CATCHABLE = {
-    "handoff": ["Don't ask \"shall I start?\" or \"I'll run it if that's OK\" for work that was already requested. Only ask before irreversible actions: production databases, deletion, sending to external services, payments, merges",
-                "Don't hand work to the human unless only a human can do it (biometric auth, payments, physical actions)",
-                "Fix problems you find before stopping. Don't stop at \"CI is failing\" or \"there's a bug\". If you can't fix it, say why",
-                "When waiting, give a time estimate. Don't stop with \"I'll wait for it to finish\""],
-    "misread": ["Don't confuse a request for a proposal or advice with a request to act. If asked for a proposal, don't implement it"],
-    "overreach": ["Don't stop to offer things that weren't asked for (\"want me to automate this too?\"). Proposals go in the last line of the report, at most",
-                  "Don't edit files outside the scope of the task"],
-    "taste": ["Answer in the language the human writes in"],
-}
+# failure type => indices into the bundled rules.md that target it at stop time
+CATCHABLE = {"handoff": [4, 5, 6, 7], "overreach": [8, 1], "misread": [3], "taste": [9]}
 NOT_CATCHABLE = "not visible at stop time (the failure only shows up later, or needs context the transcript doesn't have)"
 
 
@@ -362,73 +352,81 @@ def transcript_files(days):
 
 def scan(path):
     """Every (agent stop, what the human said next) pair in one transcript, with context and tools."""
-    rows = []
     with open(path, encoding="utf-8", errors="replace") as f:
-        for l in f:
-            try:
-                rows.append(json.loads(l))
-            except ValueError:
-                continue
-    texts = []  # (index, "a"|"h", text)
+        rows = _rows(f.read())
+    texts = []  # (row index, "a"|"h", text)
     for i, d in enumerate(rows):
         a = assistant_text(d)
         h = None if a else human_text(d)
         if a or h:
             texts.append((i, "a" if a else "h", a or h))
-    out, seen = [], set()
+    out = []
     for j in range(len(texts) - 1):
         i, kind, last = texts[j]
-        ni, nkind, nxt = texts[j + 1]
+        _, nkind, nxt = texts[j + 1]
         if kind != "a" or nkind != "h":
             continue
-        key = (nxt[:200])  # parallel agents get the same reply attached to several stops; keep the last one
-        if key in seen:
-            continue
-        seen.add(key)
         ctx = [t for _, _, t in texts[max(0, j - N_CONTEXT):j]][::-1]
         out.append({"file": path, "context": [c[:MAXLEN] for c in ctx], "tools": tools_since_turn(rows[:i + 1]),
                     "last": last[:MAXLEN], "next": nxt[:1500], "ts": rows[i].get("timestamp") or rows[i].get("ts") or ""})
     return out
 
 
-def classify(stop, key, provider):
-    url, model, _, _ = PROVIDERS[provider]
-    state = {"previous messages (newest first)": stop["context"], "tool calls this turn (oldest first)": stop["tools"],
-             "agent's final message before stopping": stop["last"], "what the human said next": stop["next"]}
-    qs = {"reaction": {"type": "choice", "instructions": "How did the human react to the agent's final message?", "criteria": REACTIONS},
-          "failure": {"type": "choice", "instructions": "If the human was unhappy, what did the agent do wrong?", "criteria": FAILURES}}
-    body = {"state": state, "questions": qs}  # both providers take choice questions with "criteria"
-    if provider == "typesafe":
-        body["model"] = cfg("LIMPET_JEV_MODEL", model)
-    try:
-        ans = call(body, key, provider)["answers"]
-        return {q: (ans[q].get("choice") or max(ans[q]["probabilities"], key=ans[q]["probabilities"].get),
-                    ans[q].get("confidence", 0)) for q in qs}
-    except Exception as e:  # noqa: BLE001
-        return {"error": str(e)[:200]}
+def past_stops(days, limit):
+    files = transcript_files(days)
+    stops = sorted((s for p in files for s in scan(p)), key=lambda s: s["ts"], reverse=True)[:limit]
+    return files, stops
+
+
+def reaction_question(stop):
+    """The human's reply goes into the question, not the state, so rule questions in the same call can't see it."""
+    return {"type": "choice", "criteria": REACTIONS,
+            "instructions": f"How did the human react to the agent's final message? The human replied: {stop['next']}"}
+
+
+def ask_all(fn, stops):
+    with ThreadPoolExecutor(8) as ex:
+        return [(s, r) for s, r in zip(stops, ex.map(fn, stops)) if "error" not in r]
+
+
+def _safe(fn):
+    def wrapped(stop):
+        try:
+            return fn(stop)
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e)[:200]}
+    return wrapped
+
+
+def _oneline(s, n=110):
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[:n] + "…"
 
 
 def suggest(days=30, limit=2000):
-    from concurrent.futures import ThreadPoolExecutor
     load_env()
     provider, key = api_key()
     if not key:
         print("limpet suggest needs a jev key (TYPESAFE_API_KEY or AI_GATEWAY_API_KEY).", file=sys.stderr)
         return 1
-    files = transcript_files(days)
-    stops = [s for p in files for s in scan(p)]
-    stops.sort(key=lambda s: s["ts"], reverse=True)
-    stops = stops[:limit]
+    files, stops = past_stops(days, limit)
     print(f"{len(stops)} stops with a human reply, from {len(files)} transcripts (last {days} days). Asking jev...", file=sys.stderr)
     t0 = time.time()
-    with ThreadPoolExecutor(8) as ex:
-        results = list(ex.map(lambda s: classify(s, key, provider), stops))
-    ok = [(s, r) for s, r in zip(stops, results) if "error" not in r]
-    errors = len(stops) - len(ok)
+
+    def classify(stop):
+        qs = {"reaction": reaction_question(stop),
+              "failure": {"type": "choice", "criteria": FAILURES,
+                          "instructions": f"If the human was unhappy, what did the agent do wrong? The human replied: {stop['next']}"}}
+        ans = call(_state(stop["context"], stop["last"], stop["tools"]), qs, key, provider)["answers"]
+        return {q: choice(ans[q]) for q in qs}
+
+    ok = ask_all(_safe(classify), stops)
     bad = [(s, r) for s, r in ok if r["reaction"][0] in ("push", "correction")]
-    lines = [f"# limpet suggest", "",
+    bundled = load_rules(os.path.join(HERE, "rules.md"))
+    lines = ["# limpet suggest", "",
              f"{len(ok)} stops from {len(files)} transcripts, last {days} days, {int(time.time() - t0)} s of jev"
-             + (f", {errors} errors" if errors else "") + ".", "", "## How the human reacted to the agent stopping", ""]
+             + (f", {len(stops) - len(ok)} errors" if len(stops) > len(ok) else "") + ".", "",
+             "## How the human reacted to the agent stopping", ""]
     counts = {k: sum(r["reaction"][0] == k for _, r in ok) for k in REACTIONS}
     for k, n in sorted(counts.items(), key=lambda x: -x[1]):
         lines.append(f"- {k:<12} {n:5}  {n / max(1, len(ok)):4.0%}")
@@ -448,7 +446,7 @@ def suggest(days=30, limit=2000):
     for k, items in sorted(by.items(), key=lambda x: -len(x[1])):
         if k in CATCHABLE and items:
             lines.append(f"<!-- {k}: {len(items) / max(1, len(bad)):.0%} of your bad stops -->")
-            lines += [f"- {rule}" for rule in CATCHABLE[k]]
+            lines += [f"- {bundled[i]}" for i in CATCHABLE[k] if i < len(bundled)]
     untargetable = sum(len(v) for k, v in by.items() if k not in CATCHABLE)
     lines += ["", f"{untargetable / max(1, len(bad)):.0%} of your bad stops are types no stop-time rule can see. "
               "Those need verification (run the tests, check CI) rather than a rule.", ""]
@@ -461,32 +459,6 @@ def suggest(days=30, limit=2000):
     return 0
 
 
-def _oneline(s, n=110):
-    s = " ".join((s or "").split())
-    return s if len(s) <= n else s[:n] + "…"
-
-
-# --- calibrate: pick thresholds from your own transcripts ---
-
-def score(stop, rules, key, provider):
-    """Rule probabilities for one past stop plus how the human reacted, in one jev call."""
-    url, model, qtype, field = PROVIDERS[provider]
-    state = {"previous messages (newest first)": stop["context"], "tool calls this turn (oldest first)": stop["tools"],
-             "agent's final message before stopping": stop["last"]}
-    qs = {f"r{i}": {"type": qtype, "instructions": f"Is the agent violating this rule? Rule: {r}"} for i, r in enumerate(rules)}
-    qs["reaction"] = {"type": "choice", "instructions": "How did the human react to the agent's final message?", "criteria": REACTIONS}
-    body = {"state": {**state, "what the human said next": stop["next"]}, "questions": qs}
-    if provider == "typesafe":
-        body["model"] = cfg("LIMPET_JEV_MODEL", model)
-    try:
-        ans = call(body, key, provider)["answers"]
-        rx = ans["reaction"]
-        return {"probs": [ans[f"r{i}"].get(field) for i in range(len(rules))],
-                "bad": (rx.get("choice") or max(rx["probabilities"], key=rx["probabilities"].get)) in ("push", "correction")}
-    except Exception as e:  # noqa: BLE001
-        return {"error": str(e)[:200]}
-
-
 def auroc(pos, neg):
     if not pos or not neg:
         return float("nan")
@@ -494,32 +466,38 @@ def auroc(pos, neg):
 
 
 def block_key(rule, rules):
-    """Shortest prefix of the rule that no other rule contains, for LIMPET_BLOCK."""
+    """Shortest prefix of the rule that no other rule contains and that LIMPET_BLOCK can parse (no ',' or '=')."""
     for n in range(6, len(rule) + 1):
         k = rule[:n]
+        if "," in k or "=" in k:
+            break
         if not any(k in r for r in rules if r != rule):
             return k
-    return rule
+    return re.sub(r"[,=].*", "", rule)[:30]
 
 
 def calibrate(days=30, limit=2000, fp=0.05):
-    from concurrent.futures import ThreadPoolExecutor
     load_env()
     provider, key = api_key()
     if not key:
         print("limpet calibrate needs a jev key (TYPESAFE_API_KEY or AI_GATEWAY_API_KEY).", file=sys.stderr)
         return 1
     rules = load_rules()
-    files = transcript_files(days)
-    stops = sorted((s for p in files for s in scan(p)), key=lambda s: s["ts"], reverse=True)[:limit]
+    files, stops = past_stops(days, limit)
     print(f"{len(stops)} stops from {len(files)} transcripts (last {days} days), {len(rules)} rules. Asking jev...", file=sys.stderr)
     t0 = time.time()
-    with ThreadPoolExecutor(8) as ex:
-        results = [r for r in ex.map(lambda s: score(s, rules, key, provider), stops) if "error" not in r]
+
+    def score(stop):
+        qs = {**rule_questions(rules, provider), "reaction": reaction_question(stop)}
+        ans = call(_state(stop["context"], stop["last"], stop["tools"]), qs, key, provider)["answers"]
+        return {"probs": [prob(ans.get(f"r{i}"), provider) for i in range(len(rules))],
+                "bad": choice(ans["reaction"])[0] in ("push", "correction")}
+
+    results = [r for _, r in ask_all(_safe(score), stops)]
     bad = [r for r in results if r["bad"]]
     good = [r for r in results if not r["bad"]]
     print(f"{len(results)} scored in {int(time.time() - t0)} s: {len(bad)} stops the human pushed back on, {len(good)} fine.\n")
-    print(f"{'AUROC':>6} {'thr':>5} {'catches':>8}  rule")
+    print(f"{'AUROC':>6} {'thr':>5} {'catches':>8} {'blocks':>7}  rule")
     spec = []
     for i, rule in enumerate(rules):
         pos = [r["probs"][i] for r in bad if r["probs"][i] is not None]
@@ -529,11 +507,13 @@ def calibrate(days=30, limit=2000, fp=0.05):
         a = auroc(pos, neg)
         thr = neg[min(len(neg) - 1, int((1 - fp) * len(neg)))]
         catch = sum(p >= thr for p in pos) / len(pos)
+        blocks = sum(n >= thr for n in neg) / len(neg)  # can exceed fp when many fine stops tie at thr
         mark = "" if a >= 0.55 else "   (does not separate; left in shadow)"
-        print(f"{a:6.2f} {thr:5.2f} {catch:7.0%}  {rule[:70]}{mark}")
+        print(f"{a:6.2f} {thr:5.2f} {catch:7.0%} {blocks:7.0%}  {rule[:70]}{mark}")
         if a >= 0.55:
             spec.append(f"{block_key(rule, rules)}={thr:.2f}")
-    print(f"\nthr = the value that blocks {fp:.0%} of your fine stops; catches = share of bad stops at or above it.")
+    print(f"\nthr = the value that blocks about {fp:.0%} of your fine stops; catches = share of bad stops at or above it; "
+          "blocks = share of fine stops actually at or above it.")
     if spec:
         print(f"\nLIMPET_BLOCK=\"{','.join(spec)}\"")
     else:
@@ -542,15 +522,20 @@ def calibrate(days=30, limit=2000, fp=0.05):
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    if "--stats" in args:
-        stats()
-    elif args and args[0] in ("suggest", "calibrate"):
-        days = int(args[args.index("--days") + 1]) if "--days" in args else 30
-        limit = int(args[args.index("--max") + 1]) if "--max" in args else 2000
-        if args[0] == "suggest":
-            sys.exit(suggest(days, limit))
-        fp = float(args[args.index("--fp") + 1]) if "--fp" in args else 0.05
-        sys.exit(calibrate(days, limit, fp))
-    else:
+    ap = argparse.ArgumentParser(description="limpet: a Stop hook backed by jev. With no subcommand, runs as the hook (JSON on stdin).")
+    sub = ap.add_subparsers(dest="cmd")
+    for name in ("suggest", "calibrate"):
+        p = sub.add_parser(name)
+        p.add_argument("--days", type=int, default=30)
+        p.add_argument("--max", type=int, default=2000)
+        if name == "calibrate":
+            p.add_argument("--fp", type=float, default=0.05, help="accepted share of fine stops to block")
+    a = ap.parse_args()
+    if a.cmd == "suggest":
+        sys.exit(suggest(a.days, a.max))
+    if a.cmd == "calibrate":
+        sys.exit(calibrate(a.days, a.max, a.fp))
+    try:
         sys.exit(main())
+    except Exception:  # noqa: BLE001  a hook must never stop the work
+        sys.exit(0)

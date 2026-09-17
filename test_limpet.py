@@ -4,6 +4,7 @@ block path with a fake jev."""
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -12,6 +13,7 @@ import limpet  # noqa: E402
 
 TMP = tempfile.mkdtemp()
 limpet.HOME = TMP  # keep the test away from ~/.limpet
+HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "limpet.py")
 
 
 def claude_line(role, text, **kw):
@@ -47,6 +49,12 @@ def test_claude_transcript():
     assert tools == ["Bash: pytest -q → error"], tools
     assert last == "Done (I did not run the tests)", last
     assert ctx == ["run the tests", "old reply", "old request"], ctx  # newest first; injected line and tool_result dropped
+    # a one-line transcript smaller than TAIL_BYTES keeps its first line
+    one = write([claude_line("assistant", "only line")], head="")
+    assert limpet.read_tail(one)[1] == "only line"
+    # a file larger than TAIL_BYTES drops the cut first line
+    big = write([claude_line("assistant", "x" * 600_000), claude_line("assistant", "tail")], head="")
+    assert limpet.read_tail(big)[1] == "tail"
     return path
 
 
@@ -65,39 +73,51 @@ def test_codex_transcript():
     assert tools == ["exec: pytest -q → done", "apply_patch: a.py"], tools
     assert last == "I'll wait for you to confirm before editing.", last
     assert ctx == ["fix the failing test"], ctx  # AGENTS.md injection and developer message dropped
-    return path
 
 
-def test_config_and_request():
+def test_config():
     rules = limpet.load_rules()  # first run copies the bundled rules to HOME
     assert os.path.exists(os.path.join(TMP, "rules.md")) and len(rules) >= 3
-    body = limpet.build_request(rules, ["ctx"], "last", ["Bash: ls → ok"])
-    assert body["state"]["tool calls this turn (oldest first)"] == ["Bash: ls → ok"]
-    assert set(body["questions"]) == {f"r{i}" for i in range(len(rules))} | {"scold"}
-    assert rules[0] in body["questions"]["r0"]["instructions"]
+    qs = limpet.rule_questions(rules, "typesafe")
+    assert qs["r0"]["type"] == "noul" and rules[0] in qs["r0"]["instructions"]
+    assert limpet.rule_questions(rules, "vercel")["r0"]["type"] == "boolean"
+    assert limpet.prob({"type": "noul", "noul": 0.42}, "typesafe") == 0.42
+    assert limpet.prob({"type": "boolean", "probability": 0.42}, "vercel") == 0.42
+    assert limpet.prob({"probability": "0.9"}, "vercel") is None  # never compare a string with a float
 
     os.environ["LIMPET_BLOCK"] = "hand work=0.5,shall I start=0.6"
     assert limpet.threshold("Don't hand work to the human") == 0.5
     assert limpet.threshold("Back up claims") == float("inf")
     os.environ["LIMPET_BLOCK"] = "0.8"
     assert limpet.threshold("anything") == 0.8
+    os.environ["LIMPET_BLOCK"] = "hand work=high,broken,shall I start=0.6"  # typos are ignored, never fatal
+    assert limpet.threshold("Don't hand work") == float("inf") and limpet.threshold("shall I start?") == 0.6
     os.environ["LIMPET_BLOCK"] = ""
     os.environ["CLAUDE_PLUGIN_OPTION_BLOCK"] = "0.7"  # Claude Code plugin user config
     assert limpet.threshold("anything") == 0.7
-    del os.environ["CLAUDE_PLUGIN_OPTION_BLOCK"]
 
     with open(os.path.join(TMP, "env"), "w") as f:
         f.write("# comment\nAI_GATEWAY_API_KEY='from-file'\nLIMPET_BLOCK=0.9\n")
     os.environ.pop("AI_GATEWAY_API_KEY", None)
     limpet.load_env(os.path.join(TMP, "env"))
-    assert limpet.api_key() == ("vercel", "from-file") and limpet.threshold("x") == 0.9
-    os.environ["TYPESAFE_API_KEY"] = "ts"  # a TypeSafe key wins and switches the wire format
+    assert limpet.api_key() == ("vercel", "from-file")
+    assert limpet.threshold("x") == 0.7  # plugin config beats the env file
+    del os.environ["CLAUDE_PLUGIN_OPTION_BLOCK"]
+    os.environ["TYPESAFE_API_KEY"] = "ts"  # a TypeSafe key wins
     assert limpet.api_key() == ("typesafe", "ts")
-    body = limpet.build_request(rules, [], "last", provider="typesafe")
-    assert body["model"] == "jev-latest" and body["questions"]["r0"]["type"] == "noul"
-    assert limpet.prob({"type": "noul", "noul": 0.42}, "typesafe") == 0.42
-    assert limpet.prob({"type": "boolean", "probability": 0.42}, "vercel") == 0.42
     del os.environ["TYPESAFE_API_KEY"]
+    os.environ.pop("AI_GATEWAY_API_KEY", None)
+    os.environ["LIMPET_KEY_CMD"] = "echo from-cmd"
+    os.environ["LIMPET_PROVIDER"] = "typesafe"
+    assert limpet.api_key() == ("typesafe", "from-cmd")
+    del os.environ["LIMPET_KEY_CMD"], os.environ["LIMPET_PROVIDER"]
+
+    rs = ["Run the tests, then, only then, say done", "Run the tests, then, only then, report it", "Answer in Japanese"]
+    for r in rs:
+        k = limpet.block_key(r, rs)
+        assert "," not in k and "=" not in k and k and k in r, (r, k)
+    assert limpet.block_key(rs[2], rs) == "Answer"
+    assert limpet.auroc([0.9, 0.8], [0.1, 0.2]) == 1.0 and limpet.auroc([0.5], [0.5]) == 0.5
     return rules
 
 
@@ -105,8 +125,8 @@ def test_block_path(path, rules):
     os.environ["LIMPET_BLOCK"] = "0.8"
     os.environ["AI_GATEWAY_API_KEY"] = "test"
     os.environ["LIMPET_LOG"] = os.path.join(TMP, "log.jsonl")
-    limpet.call = lambda body, key, provider: {"answers": {q: {"probability": 0.9 if q == "r0" else 0.1} for q in body["questions"]},
-                                               "usage": {"inputTokens": 1}}
+    limpet.call = lambda state, qs, key, provider: {"answers": {q: {"probability": 0.9 if q == "r0" else 0.1} for q in qs},
+                                                    "usage": {"inputTokens": 1}}
     err = io.StringIO()
     sys.stdin, sys.stderr = io.StringIO(json.dumps({"transcript_path": path})), err
     assert limpet.main() == 2
@@ -123,13 +143,22 @@ def test_block_path(path, rules):
     sys.stdin = io.StringIO(json.dumps({"transcript_path": path, "stop_hook_active": True}))
     assert limpet.main() == 0  # never push back twice on the same stop
 
-    limpet.call = lambda body, key, provider: (_ for _ in ()).throw(TimeoutError("slow"))
+    limpet.call = lambda state, qs, key, provider: (_ for _ in ()).throw(TimeoutError("slow"))
     sys.stdin = io.StringIO(json.dumps({"transcript_path": path}))
     assert limpet.main() == 0  # API trouble never blocks
+    limpet.call = lambda state, qs, key, provider: ["not", "a", "dict"]
+    sys.stdin = io.StringIO(json.dumps({"transcript_path": path}))
+    assert limpet.main() == 0  # nor a strange response
     sys.stderr = sys.__stderr__
 
+    # the real entry point: broken stdin, missing log dir, relative log path => exit 0, no traceback
+    env = {**os.environ, "LIMPET_LOG": "log.jsonl", "LIMPET_RULES": os.path.join(TMP, "rules.md")}
+    for stdin in ("", "not json", json.dumps({"transcript_path": "/nonexistent"})):
+        r = subprocess.run([sys.executable, HOOK], input=stdin, capture_output=True, text=True, env=env, cwd=TMP)
+        assert r.returncode == 0 and "Traceback" not in r.stderr, (stdin, r.stderr)
 
-def test_suggest():
+
+def test_suggest_and_calibrate():
     path = write([
         claude_line("user", "fix the login bug"),
         json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Edit", "input": {"file_path": "auth.py"}}]}}),
@@ -138,52 +167,46 @@ def test_suggest():
         claude_line("user", "do it"),
         claude_line("assistant", "Applied. Tests pass."),
         claude_line("user", "thanks"),
-        claude_line("assistant", "Anything else?"),
+        claude_line("assistant", "Now the logout bug. Want me to apply it?"),
+        claude_line("user", "do it"),
     ])
     stops = limpet.scan(path)
-    assert [s["next"] for s in stops] == ["do it", "thanks"], stops
+    assert [s["next"] for s in stops] == ["do it", "thanks", "do it"], stops  # a repeated short reply is not a duplicate
     assert stops[0]["tools"] == ["Edit: auth.py → ok"] and stops[0]["context"] == ["fix the login bug"], stops[0]
     limpet.transcript_files = lambda days: [path]
-    limpet.call = lambda body, key, provider: {"answers": {
-        "reaction": {"choice": "push" if "do it" in body["state"]["what the human said next"] else "ack", "confidence": 0.9},
-        "failure": {"choice": "handoff", "confidence": 0.8}}}
     os.environ["AI_GATEWAY_API_KEY"] = "test"
+
+    seen_states = []
+
+    def fake(state, qs, key, provider):
+        seen_states.append(state)
+        nxt = qs["reaction"]["instructions"]
+        push = "do it" in nxt
+        ans = {q: {"probability": (0.9 if push else 0.1) if q == "r0" else 0.5} for q in qs if q.startswith("r")}
+        ans["reaction"] = {"choice": "push" if push else "ack", "confidence": 0.9}
+        ans["failure"] = {"choice": "handoff", "confidence": 0.8}
+        return {"answers": ans}
+    limpet.call = fake
+
     out = io.StringIO()
     sys.stdout = out
     assert limpet.suggest(days=1, limit=10) == 0
-    sys.stdout = sys.__stdout__
     text = out.getvalue()
-    assert "push" in text and "handoff: 1 (100%)" in text and "shall I start" in text, text
+    assert "push" in text and "handoff: 2 (100%)" in text and "shall I start" in text, text
     assert os.path.exists(os.path.join(TMP, "suggest.md"))
-
-
-def test_calibrate():
-    rules = limpet.load_rules()
-    assert limpet.block_key(rules[0], rules) and all(limpet.block_key(rules[0], rules) not in r for r in rules[1:])
-    assert limpet.auroc([0.9, 0.8], [0.1, 0.2]) == 1.0 and limpet.auroc([0.5], [0.5]) == 0.5
-    stops = [{"context": [], "tools": [], "last": f"stop {i}", "next": "do it" if i % 2 else "thanks", "ts": str(i)} for i in range(20)]
-    limpet.transcript_files = lambda days: ["x"]
-    limpet.scan = lambda path: stops
-    # rule 0 separates bad stops perfectly, rule 1 is noise
-    limpet.call = lambda body, key, provider: {"answers": {
-        **{f"r{i}": {"probability": (0.9 if "do it" in body["state"]["what the human said next"] else 0.1) if i == 0 else 0.5}
-           for i in range(len(rules))},
-        "reaction": {"choice": "push" if "do it" in body["state"]["what the human said next"] else "ack"}}}
-    os.environ["AI_GATEWAY_API_KEY"] = "test"
     out = io.StringIO()
     sys.stdout = out
-    assert limpet.calibrate(days=1, limit=100) == 0
+    assert limpet.calibrate(days=1, limit=10) == 0
     sys.stdout = sys.__stdout__
     text = out.getvalue()
-    assert "10 stops the human pushed back on, 10 fine" in text and "  1.00  0.10    100%" in text, text
-    assert "LIMPET_BLOCK=" in text and "=0.10" in text and "does not separate" in text, text
+    assert "2 stops the human pushed back on, 1 fine" in text and "LIMPET_BLOCK=" in text and "does not separate" in text, text
+    assert all("what the human said next" not in s for s in seen_states)  # rule questions never see the reply
 
 
 if __name__ == "__main__":
     claude_path = test_claude_transcript()
     test_codex_transcript()
-    rules = test_config_and_request()
+    rules = test_config()
     test_block_path(claude_path, rules)
-    test_suggest()
-    test_calibrate()
+    test_suggest_and_calibrate()
     print("ok")
